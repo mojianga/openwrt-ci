@@ -1,20 +1,22 @@
-name: IPQ60XX-24.10-6.12-WIFI
+name: netcore-n60pro-immortal
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: 0 19 * * *
+    - cron: '0 20 * * 6'
+  watch:
+    types: [started]
 
 env:
-  REPO_URL: https://github.com/LiBwrt/openwrt-6.x.git
-  REPO_BRANCH: 24.10-6.12
-  CONFIG_FILE: configs/ipq60xx-6.12-wifi.config
-  DIY_SCRIPT: diy-script.sh
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: master
+  CONFIG_FILE: configs/netcore-n60pro-immortal.config
+  DIY_SCRIPT: netcore-n60pro-immortal.sh
   CLASH_KERNEL: amd64
   CACHE_TOOLCHAIN: true
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
-  FIRMWARE_TAG: IPQ60XX-24.10-6.12-WIFI
+  FIRMWARE_TAG: netcore-n60pro-immortal
   TZ: Asia/Shanghai
 
 jobs:
@@ -49,6 +51,7 @@ jobs:
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get -y clean
         sudo timedatectl set-timezone "$TZ"
+        sudo -E apt-get -y install dwarves clang llvm
 
     - name: Combine Disks(合并磁盘)
       uses: easimon/maximize-build-space@master
@@ -63,11 +66,21 @@ jobs:
     - name: Clone Source Code(克隆源代码)
       run: |
         df -hT $GITHUB_WORKSPACE
-        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
         cd openwrt
         echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
         VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
         echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+
+    - name: Clone package
+      run: |
+          cd $OPENWRT_PATH
+          # git clone --depth=1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
+          # git clone --depth=1 https://github.com/nikkinikki-org/OpenWrt-nikki.git package/nikki
+          sed -i '1i src-git easytier https://github.com/EasyTier/luci-app-easytier.git;main' feeds.conf.default
+          sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
+          sed -i '1i src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main' feeds.conf.default
+          sed -i '1i src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main' feeds.conf.default
 
     - name: Generate Variables(生成变量)
       run: |
@@ -94,16 +107,23 @@ jobs:
         cd $OPENWRT_PATH
         ./scripts/feeds update -a
         ./scripts/feeds install -a
-  
+
     - name: Load Custom Configuration(加载自定义配置)
       run: |
-        [ -e files ] && mv files $OPENWRT_PATH/files
+        [ -e pppoe-files ] && chmod +x pppoe-files/* && mv pppoe-files $OPENWRT_PATH/files
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
+
+    - name: Mod Script
+      run: |
+        chmod +x $DIY_SCRIPT
+        cd $OPENWRT_PATH
+        $GITHUB_WORKSPACE/$DIY_SCRIPT
 
     - name: Download DL Package(下载DL软件包)
       run: |
         cd $OPENWRT_PATH
         make defconfig
+        cat .config
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -135,7 +155,7 @@ jobs:
         cd $OPENWRT_PATH/bin/targets/*/*
         cat sha256sums
         cp $OPENWRT_PATH/.config build.config
-        mv -f $OPENWRT_PATH/bin/packages/*/*/*.ipk packages
+        mv -f $OPENWRT_PATH/bin/packages/*/*/*.apk packages
         tar -zcf Packages.tar.gz packages
         rm -rf packages feeds.buildinfo version.buildinfo
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
@@ -158,12 +178,12 @@ jobs:
         artifacts: ${{ env.FIRMWARE_PATH }}/*
         body: |
           **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
-          ### 📒 固件信息24.10(WIFI)
-          - 带WIFI带有线NSS的6.12内核固件
+          ### 📒 固件信息(netcore-n60pro)
+          - 这是 netcore-n60pro kernel
           - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
           - ⚽ 固件源码: ${{ env.REPO_URL }}
           - 💝 源码分支: ${{ env.REPO_BRANCH }}
-          - 🌐 默认地址: 192.168.1.1
+          - 🌐 默认地址: 10.0.0.1
           - 🔑 默认密码: password
           ### 🧊 固件版本
           - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录

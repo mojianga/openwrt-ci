@@ -1,0 +1,191 @@
+name: netcore-n60pro-237
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 20 * * 6'
+  watch:
+    types: [started]
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+  REPO_BRANCH: openwrt-24.10-6.6
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: configs/netcore-n60pro-237-padavanonly.config
+  DIY_SCRIPT: netcore-n60pro-237.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  FIRMWARE_TAG: padavanonly-237-mt798x-2410-6.6
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone -b $REPO_BRANCH --single-branch --filter=blob:none $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        cd openwrt
+        echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+
+    - name: Clone package
+      run: |
+          cd $OPENWRT_PATH
+          # git clone --depth=1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
+          # git clone --depth=1 https://github.com/nikkinikki-org/OpenWrt-nikki.git package/nikki
+          sed -i '1i src-git easytier https://github.com/EasyTier/luci-app-easytier.git;main' feeds.conf.default
+          sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
+          sed -i '1i src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main' feeds.conf.default
+          sed -i '1i src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main' feeds.conf.default
+
+    - name: Generate Variables(生成变量)
+      run: |
+        # cp $CONFIG_FILE $OPENWRT_PATH/.config
+        # cd $OPENWRT_PATH
+        # make defconfig > /dev/null 2>&1
+        SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
+        echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+        # DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+        # echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+        # DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+        # echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+
+    - name: Update feeds
+      run: |
+        cd $OPENWRT_PATH
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        # 直接使用高功率模版
+        cp -f defconfig/nx60pro-ipailna-high-power.config .config
+
+    - name: Load Custom Configuration(加载自定义配置)
+      run: |
+        [ -e pppoe-files ] && mv pppoe-files $OPENWRT_PATH/files
+        [ -e $CONFIG_FILE ] && cat $CONFIG_FILE >> $OPENWRT_PATH/.config
+        
+    - name: Mod Script
+      run: |
+        chmod +x $DIY_SCRIPT
+        cd $OPENWRT_PATH
+        $GITHUB_WORKSPACE/$DIY_SCRIPT
+  
+    - name: Download package
+      id: package
+      run: |
+        cd $OPENWRT_PATH
+        make defconfig
+        cat .config
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd $OPENWRT_PATH
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.OPENWRT_PATH }}/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd $OPENWRT_PATH/bin/targets/*/*
+        cp $OPENWRT_PATH/.config build.config
+        mv -f $OPENWRT_PATH/bin/packages/*/*/*.ipk packages
+        tar -zcf Packages.tar.gz packages
+        rm -rf packages feeds.buildinfo version.buildinfo
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${{ env.FIRMWARE_TAG }}" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      uses: ncipollo/release-action@v1
+      with:
+        name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
+        allowUpdates: true
+        tag: ${{ env.FIRMWARE_TAG }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: ${{ env.FIRMWARE }}/*
+        body: |
+          **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
+          ### 📒 固件信息(netcore-n60-pro)
+          - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
+          - ⚽ 固件源码: ${{ env.REPO_URL }}
+          - 💝 源码分支: ${{ env.REPO_BRANCH }}
+          - 🌐 默认地址: 10.0.0.1
+          - 🔑 默认密码: password
+          ### 🧊 固件版本
+          - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+          - ${{ env.VERSION_INFO }}
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 6
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
