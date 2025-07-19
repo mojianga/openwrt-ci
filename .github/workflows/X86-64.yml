@@ -3,7 +3,7 @@ name: X86-64
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 22 * * 6'
+    - cron: '0 20 * * 6'
   watch:
     types: [started]
 
