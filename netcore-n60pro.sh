@@ -11,8 +11,11 @@ sed -i 's/192.168.6.1/10.0.0.1/g' package/base-files/files/bin/config_generate
 git clone --depth=1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
 
 # nikki
-printf "\nsrc-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main\n" >> "feeds.conf.default"
+# printf "\nsrc-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main\n" >> "feeds.conf.default"
+sed '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
 
 # passwall
-printf "\nsrc-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main\n" >> "feeds.conf.default"
-printf "\nsrc-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main\n" >> "feeds.conf.default"
+# printf "\nsrc-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main\n" >> "feeds.conf.default"
+# printf "\nsrc-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main\n" >> "feeds.conf.default"
+sed '1i src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main' feeds.conf.default
+sed '1i src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall.git;main' feeds.conf.default
