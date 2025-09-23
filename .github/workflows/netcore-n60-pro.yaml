@@ -64,6 +64,12 @@ jobs:
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
+    - name: Mod Script
+      run: |
+        chmod +x $DIY_SCRIPT
+        cd $OPENWRT_PATH
+        $GITHUB_WORKSPACE/$DIY_SCRIPT
+
     - name: Update feeds
       run: |
         cd $OPENWRT_PATH
@@ -74,17 +80,6 @@ jobs:
       run: |
         [ -e files ] && mv files openwrt/files
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
-        chmod +x $DIY_SCRIPT
-        cd $OPENWRT_PATH
-        $GITHUB_WORKSPACE/$DIY_SCRIPT
-
-    # - name: Load Custom Configuration(加载自定义配置)
-    #   run: |
-    #     cd $OPENWRT_PATH
-    #     rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls}
-    #     git clone https://github.com/xiaorouji/openwrt-passwall-packages package/passwall-packages
-    #     rm -rf feeds/luci/applications/luci-app-passwall
-    #     git clone https://github.com/xiaorouji/openwrt-passwall package/passwall-luci
   
     - name: Download package
       id: package
