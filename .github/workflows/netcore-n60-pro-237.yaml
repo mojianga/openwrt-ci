@@ -11,8 +11,8 @@ env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
   REPO_BRANCH: openwrt-24.10-6.6
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: configs/padavanonly-immortalwrt-mt798x.config
-  DIY_SCRIPT: netcore-n60pro.sh
+  CONFIG_FILE: configs/padavanonly-immortalwrt-mt798x-237.config
+  DIY_SCRIPT: netcore-n60pro-237.sh
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
