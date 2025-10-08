@@ -24,35 +24,42 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
 
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
+        docker rmi $(docker images -q)
+        sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android $AGENT_TOOLSDIRECTORY
+        sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204)
+        sudo -E systemctl daemon-reload
+        sudo -E apt-get -y autoremove --purge
+        sudo -E apt-get -y clean
         sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+        sudo -E apt-get -y install dwarves clang llvm
 
-    - name: Clone source code
-      working-directory: /workdir
+    - name: Combine Disks(合并磁盘)
+      uses: easimon/maximize-build-space@master
+      with:
+        swap-size-mb: 1024
+        temp-reserve-mb: 100
+        root-reserve-mb: 1024
+
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Clone Source Code(克隆源代码)
       run: |
-        df -hT $PWD
-        git clone -b $REPO_BRANCH --single-branch --filter=blob:none $REPO_URL openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        df -hT $GITHUB_WORKSPACE
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
         cd openwrt
         echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
         VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
         echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
 
-    - name: Clone package
+    - name: Clone package(修改默认feeds)
       run: |
           cd $OPENWRT_PATH
           # git clone --depth=1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
@@ -74,7 +81,7 @@ jobs:
         # DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         # echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
 
-    - name: Update feeds
+    - name: Update feeds(安装feeds)
       run: |
         cd $OPENWRT_PATH
         ./scripts/feeds update -a
@@ -87,13 +94,13 @@ jobs:
         [ -e pppoe-files ] && mv pppoe-files $OPENWRT_PATH/files
         [ -e $CONFIG_FILE ] && cat $CONFIG_FILE >> $OPENWRT_PATH/.config
         
-    - name: Mod Script
+    - name: Mod Script(自定义脚本)
       run: |
         chmod +x $DIY_SCRIPT
         cd $OPENWRT_PATH
         $GITHUB_WORKSPACE/$DIY_SCRIPT
   
-    - name: Download package
+    - name: Download package(下载DL软件包)
       id: package
       run: |
         cd $OPENWRT_PATH
@@ -103,7 +110,7 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile the firmware
+    - name: Compile the firmware(编译固件)
       id: compile
       run: |
         cd $OPENWRT_PATH
@@ -165,7 +172,7 @@ jobs:
         artifacts: ${{ env.FIRMWARE }}/*
         body: |
           **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
-          ### 📒 固件信息(netcore-n60-pro)
+          ### 📒 固件信息(netcore-n60pro 237高功率固件)
           - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
           - ⚽ 固件源码: ${{ env.REPO_URL }}
           - 💝 源码分支: ${{ env.REPO_BRANCH }}

@@ -113,7 +113,7 @@ jobs:
         [ -e pppoe-files ] && chmod +x pppoe-files/* && mv pppoe-files $OPENWRT_PATH/files
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
 
-    - name: Mod Script
+    - name: Mod Script(自定义脚本)
       run: |
         chmod +x $DIY_SCRIPT
         cd $OPENWRT_PATH
@@ -178,7 +178,7 @@ jobs:
         artifacts: ${{ env.FIRMWARE_PATH }}/*
         body: |
           **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
-          ### 📒 固件信息(netcore-n60pro)
+          ### 📒 固件信息(netcore-n60pro immortalwrt固件)
           - 这是 netcore-n60pro kernel
           - 💻 这是 ${{ env.FIRMWARE_TAG }} 平台使用的 OpenWrt 固件
           - ⚽ 固件源码: ${{ env.REPO_URL }}
