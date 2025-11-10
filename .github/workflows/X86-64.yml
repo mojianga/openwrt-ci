@@ -13,7 +13,7 @@ env:
   CONFIG_FILE: configs/x86-64.config
   DIY_SCRIPT: x86.sh
   CLASH_KERNEL: amd64
-  CACHE_TOOLCHAIN: true
+  CACHE_TOOLCHAIN: false
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: X86-64
