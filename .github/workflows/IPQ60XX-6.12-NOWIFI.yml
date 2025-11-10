@@ -13,7 +13,7 @@ env:
   CONFIG_FILE: configs/ipq60xx-6.12-nowifi.config
   DIY_SCRIPT: libwrt.sh
   CLASH_KERNEL: amd64
-  CACHE_TOOLCHAIN: true
+  CACHE_TOOLCHAIN: false
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: IPQ60XX-6.12-NOWIFI
