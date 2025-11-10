@@ -13,7 +13,7 @@ env:
   CONFIG_FILE: configs/netcore-n60pro-immortal.config
   DIY_SCRIPT: netcore-n60pro-immortal.sh
   CLASH_KERNEL: amd64
-  CACHE_TOOLCHAIN: true
+  CACHE_TOOLCHAIN: false
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: netcore-n60pro-immortal
