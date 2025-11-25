@@ -3,7 +3,7 @@ name: IPQ60XX-6.12-NOWIFI
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 20 * * 2,6'
+    - cron: '0 20 * * 2,5'
   watch:
     types: [started]
 
