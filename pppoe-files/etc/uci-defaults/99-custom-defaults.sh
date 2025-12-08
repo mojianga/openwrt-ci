@@ -3,7 +3,7 @@
 
 # Your UCI commands or other shell commands here
 uci set network.wan.proto=pppoe
-uci set network.wan.username='clan'
+uci set network.wan.username='clan2101243254'
 uci set network.wan.password='123456'
 
 # wifi
