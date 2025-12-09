@@ -88,7 +88,7 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         # 直接使用高功率模版
-        cp -f defconfig/nx60pro-ipailna-high-power.config .config
+        cp -f defconfig/mt7975-ipailna-high-power.config .config
 
     - name: Load Custom Configuration(加载自定义配置)
       run: |
