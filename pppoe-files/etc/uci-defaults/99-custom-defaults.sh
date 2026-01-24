@@ -24,6 +24,9 @@ uci set wireless.default_radio1.ocv='0'
 uci set wireless.default_radio1.country='US'
 uci set wireless.default_radio1.channel='36'
 uci set wireless.default_radio0.htmode='HE160'
+uci set wireless.radio1.htmode='HE160'
+uci set wireless.radio1.channel='auto'
+uci set wireless.radio1.country='US'
 
 uci commit network
 /etc/init.d/network restart
