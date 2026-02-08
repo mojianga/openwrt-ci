@@ -17,6 +17,7 @@ uci set wireless.default_radio0.channel='1'
 uci set wireless.default_radio0.htmode='HE40'
 uci set wireless.radio0.htmode='HE40'
 uci set wireless.radio0.country='US'
+uci set wireless.radio0.channel='1'
 
 uci set wireless.radio1.cell_density='0'
 uci set wireless.default_radio1.ssid='58G'
@@ -27,7 +28,7 @@ uci set wireless.default_radio1.country='US'
 uci set wireless.default_radio1.channel='36'
 uci set wireless.default_radio0.htmode='HE160'
 uci set wireless.radio1.htmode='HE160'
-uci set wireless.radio1.channel='auto'
+uci set wireless.radio1.channel='36'
 uci set wireless.radio1.country='US'
 
 uci commit network
