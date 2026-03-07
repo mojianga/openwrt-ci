@@ -1,6 +1,5 @@
 # 修改默认IP
-sed -i 's/192.168.1.1/10.0.0.1/g' package/base-files/files/bin/config_generate
-sed -i 's/192.168.6.1/10.0.0.1/g' package/base-files/files/bin/config_generate
+sed -i 's/192.168.1.1/192.168.12.1/g' package/base-files/files/bin/config_generate
 
 # 取消以下硬件的编译
 sed -i '/glinet_gl-mt6000\|tplink_tl-xdr6086\|tplink_tl-xdr6088\|xiaomi_redmi-router-ax6000\|xiaomi_redmi-router-ax6000-stock/d' .config
