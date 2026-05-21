@@ -12,3 +12,6 @@ find . -type d -name "sing-box" -exec rm -rf {} +
 git clone --depth=1 https://github.com/kenzok8/small-package.git /tmp/kenzok8
 mv /tmp/kenzok8/sing-box/ feeds/packages/net/
 
+# 替换golang
+rm -rf feeds/packages/lang/golang
+git clone --depth=1 https://github.com/sbwml/packages_lang_golang.git feeds/packages/lang/golang
