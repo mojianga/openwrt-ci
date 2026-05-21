@@ -7,9 +7,14 @@ sed -i '/glinet_gl-mt6000\|tplink_tl-xdr6086\|tplink_tl-xdr6088\|xiaomi_redmi-ro
 # 去掉以下插件
 sed -i '/argon/d' .config
 
-# 升级编译时使用的golang版本
+# 替换sing-box
+find . -type d -name "sing-box" -exec rm -rf {} +
+git clone --depth=1 https://github.com/kenzok8/small-package.git /tmp/kenzok8
+mv /tmp/kenzok8/sing-box/ feeds/packages/net/
+
+# 替换golang
 rm -rf feeds/packages/lang/golang
-git clone --depth=1 https://github.com/sbwml/packages_lang_golang feeds/packages/lang/golang
+git clone --depth=1 https://github.com/sbwml/packages_lang_golang.git feeds/packages/lang/golang
 
 # 如果是这个uboot, https://drive.wrt.moe/uboot/mediatek 
 # 存在web升级的问题
