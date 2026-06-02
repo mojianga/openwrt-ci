@@ -3,7 +3,7 @@ name: netcore-n60pro-immortal
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 20 * * 5'
+    - cron: '0 8 5 */1 *'
   watch:
     types: [started]
 
