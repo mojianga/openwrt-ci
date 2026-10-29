@@ -14,7 +14,6 @@ env:
   DIY_SCRIPT: netcore-n60pro-immortal-506m.sh
   LAYOUT_NAME: spi-nand-512MB-ubi-506.5MB
   UBI_SIZE: '0x1fa80000'
-  CLASH_KERNEL: amd64
   CACHE_TOOLCHAIN: false
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
