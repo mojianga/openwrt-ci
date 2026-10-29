@@ -2,10 +2,10 @@ name: netcore-n60pro-immortal
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 8 5 */1 *'
-  watch:
-    types: [started]
+  # schedule:
+  #   - cron: '0 8 5 */1 *'
+  # watch:
+  #   types: [started]
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
