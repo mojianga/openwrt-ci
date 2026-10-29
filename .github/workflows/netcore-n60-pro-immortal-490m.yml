@@ -2,6 +2,8 @@ name: netcore-n60pro-immortal-490m
 
 on:
   workflow_dispatch:
+  watch:
+    types: [started]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,7 +16,7 @@ env:
   DIY_SCRIPT: netcore-n60pro-immortal-490m.sh
   LAYOUT_NAME: spi-nand-512MB-ubi-490MB
   UBI_SIZE: '0x1ea00000'
-  CACHE_TOOLCHAIN: false
+  CACHE_TOOLCHAIN: false    # 改成 true 可复用工具链缓存，重复编译明显提速
   UPLOAD_BIN_DIR: false
   FIRMWARE_RELEASE: true
   FIRMWARE_TAG: netcore-n60pro-immortal-490m
@@ -22,6 +24,8 @@ env:
 
 jobs:
   Build:
+    # 设置仓库变量 STAR_ACTOR=<你的GitHub用户名> 后，只有该账号 star/手动触发才编译
+    if: vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
     runs-on: ubuntu-24.04
 
     steps:
