@@ -35,9 +35,6 @@ jobs:
     if: vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@main
-
       - name: Initialization Environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -58,6 +55,16 @@ jobs:
           remove-android: 'true'
           remove-haskell: 'true'
           remove-codeql: 'true'
+
+      # 注意：maximize-build-space 会重建 workspace 挂载点，必须放在 checkout 之前，
+      # 否则已检出的 configs/、DIY 脚本会被清空（报 cp: cannot stat ...）
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Verify Repo Files
+        run: |
+          test -f "$CONFIG_FILE" || { echo "ERROR: 缺少 $CONFIG_FILE"; ls -al; exit 1; }
+          test -f "$DIY_SCRIPT" || { echo "ERROR: 缺少 $DIY_SCRIPT"; ls -al; exit 1; }
 
       - name: Clone Source Code
         run: |
