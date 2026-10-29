@@ -1,0 +1,243 @@
+name: netcore-n60pro-immortal-dual
+
+# 单 job 出两种分区固件：先按 506.5MB 完整编译，改 DTS 后仅重建 dtb/kernel/镜像出 490MB
+# 前置要求：configs/netcore-n60pro-immortal.config 里不能有 CONFIG_IB / CONFIG_SDK
+
+on:
+  workflow_dispatch:
+  watch:
+    types: [started]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: master
+  CONFIG_FILE: configs/netcore-n60pro-immortal.config
+  DIY_SCRIPT: netcore-n60pro-immortal-506m.sh
+  CACHE_TOOLCHAIN: 'true'
+  TZ: Asia/Shanghai
+  DTS_PATH: target/linux/mediatek/dts/mt7986a-netcore-n60-pro.dts
+  UBI_506M: 0x0580000 0x1fa80000
+  UBI_490M: 0x0580000 0x1ea00000
+  TAG_506M: netcore-n60pro-immortal-506m
+  TAG_490M: netcore-n60pro-immortal-490m
+
+jobs:
+  build:
+    name: Build N60 Pro (506M + 490M)
+    runs-on: ubuntu-24.04
+    if: vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo -E apt-get -y install device-tree-compiler
+          sudo timedatectl set-timezone "$TZ"
+          sudo systemctl daemon-reload
+
+      - name: Combine Disks
+        uses: easimon/maximize-build-space@master
+        with:
+          swap-size-mb: 1024
+          temp-reserve-mb: 100
+          root-reserve-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Clone Source Code
+        run: |
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          echo "OPENWRT_PATH=$PWD/openwrt" >> $GITHUB_ENV
+          cd openwrt
+          echo "SOURCE_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "SOURCE_DATE=$(git show -s --date=short --format=%cd)" >> $GITHUB_ENV
+
+      - name: Clone package
+        run: |
+          cd openwrt
+          sed -i '1i src-git easytier https://github.com/EasyTier/luci-app-easytier.git;main' feeds.conf.default
+          sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
+          sed -i '1i src-git momo https://github.com/nikkinikki-org/OpenWrt-momo.git;main' feeds.conf.default
+
+      - name: Generate Variables
+        run: |
+          cp $CONFIG_FILE $OPENWRT_PATH/.config
+          cd $OPENWRT_PATH
+          make defconfig > /dev/null 2>&1
+
+          echo "SOURCE_REPO=$(echo $REPO_URL | awk -F '/' '{print $(NF)}')" >> $GITHUB_ENV
+          echo "DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
+          echo "DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
+
+          # 守卫 1：CONFIG_IB=y 会让 subtarget 下所有设备内核都参与构建（会把 keenetic_kn-1012 拉进来并因缺 u-boot.bin 失败）
+          if grep -q '^CONFIG_IB=y' .config; then
+            echo "ERROR: .config 中 CONFIG_IB=y，请从 $CONFIG_FILE 中删除 CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK"
+            exit 1
+          fi
+          # 守卫 2：必须且只能是 netcore_n60-pro 一个设备
+          DEV_NUM=$(grep -c '^CONFIG_TARGET_[a-z0-9_]*_DEVICE_.*=y$' .config || true)
+          echo "selected device count = $DEV_NUM"
+          if ! grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_netcore_n60-pro=y' .config; then
+            echo "ERROR: 未选中 netcore_n60-pro"
+            exit 1
+          fi
+          grep '^CONFIG_TARGET_.*_DEVICE_.*=y$' .config
+
+      - name: Cache Toolchain
+        if: env.CACHE_TOOLCHAIN == 'true'
+        uses: HiGarfield/cachewrtbuild@main
+        with:
+          ccache: 'false'
+          mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+          prefix: ${{ env.OPENWRT_PATH }}
+
+      - name: Install Feeds
+        run: |
+          cd $OPENWRT_PATH
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load Custom Configuration
+        run: |
+          cp -f $CONFIG_FILE $OPENWRT_PATH/.config
+          if [ -d pppoe-files ]; then
+            chmod +x pppoe-files/* || true
+            mv pppoe-files $OPENWRT_PATH/files
+          fi
+
+      - name: Mod Script
+        run: |
+          chmod +x $DIY_SCRIPT
+          cd $OPENWRT_PATH
+          $GITHUB_WORKSPACE/$DIY_SCRIPT
+
+      - name: Download DL Package
+        run: |
+          cd $OPENWRT_PATH
+          make defconfig
+          make download -j8 || make download -j1 V=s
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      # ============ 第一遍：506.5MB 分区，完整编译 ============
+      - name: Build Firmware (506M)
+        run: |
+          cd $OPENWRT_PATH
+          echo "nproc = $(nproc)"
+          make -j$(nproc) || make -j1 || make -j1 V=s
+
+      - name: Verify DTS Partition (506M)
+        run: |
+          cd $OPENWRT_PATH
+          DTB=$(find build_dir -name 'image-mt7986a-netcore-n60-pro.dtb' | head -1)
+          [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
+          dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
+          dtc -I dtb -O dts "$DTB" | grep -qi "0x1fa80000" || { echo "ERROR: ubi 分区不是 506.5MB"; exit 1; }
+
+      - name: Collect Firmware (506M)
+        run: |
+          cd $OPENWRT_PATH
+          OUT=$GITHUB_WORKSPACE/fw/506m
+          mkdir -p $OUT
+          shopt -s nullglob
+          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
+            base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
+            cp -f "$f" "$OUT/${stem}-506m.${ext}"
+          done
+          cp -f .config $OUT/build-506m.config || true
+          ( cd $OUT && sha256sum * > sha256sums-506m.txt )
+          ls -l $OUT
+
+      # ============ 第二遍：只改 DTS，复用已编译的工具链/软件包 ============
+      - name: Rebuild Firmware (490M)
+        run: |
+          cd $OPENWRT_PATH
+          grep -qF "$UBI_506M" $DTS_PATH || { echo "ERROR: 未找到 506M 分区定义，上游 DTS 可能已变更"; exit 1; }
+          sed -i "s/$UBI_506M/$UBI_490M/" $DTS_PATH
+          echo "==================== DTS 已切换为 490M ===================="
+          grep -n -A3 'label = "ubi"' $DTS_PATH
+
+          # 只删掉与 dtb / 设备 kernel 相关的产物，强制重新生成（vmlinux、软件包全部复用）
+          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/image-mt7986a-netcore_n60-pro.dtb
+          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/image-mt7986a-netcore-n60-pro.dtb
+          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/netcore_n60-pro-kernel.bin
+          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/linux-*/arch/arm64/boot/dts/mediatek/mt7986a-netcore-n60-pro.dtb
+
+          make -j$(nproc) || make -j1 || make -j1 V=s
+
+      - name: Verify DTS Partition (490M)
+        run: |
+          cd $OPENWRT_PATH
+          DTB=$(find build_dir -name 'image-mt7986a-netcore-n60-pro.dtb' | head -1)
+          [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
+          dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
+          dtc -I dtb -O dts "$DTB" | grep -qi "0x1ea00000" || { echo "ERROR: ubi 分区不是 490MB"; exit 1; }
+
+      - name: Collect Firmware (490M)
+        run: |
+          cd $OPENWRT_PATH
+          OUT=$GITHUB_WORKSPACE/fw/490m
+          mkdir -p $OUT
+          shopt -s nullglob
+          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
+            base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
+            cp -f "$f" "$OUT/${stem}-490m.${ext}"
+          done
+          cp -f .config $OUT/build-490m.config || true
+          ( cd $OUT && sha256sum * > sha256sums-490m.txt )
+          ls -l $OUT
+
+      - name: Upload Firmware To Release (506M)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG_506M }}
+          name: ImmortalWrt N60 Pro 506.5MB
+          body: |
+            Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
+            分区布局：spi-nand-512MB-ubi-506.5MB（ubi 0x0580000 + 0x1fa80000）
+
+            默认地址：192.168.12.1  默认用户：root  默认密码：password
+            源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
+          artifacts: fw/506m/*
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Firmware To Release (490M)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG_490M }}
+          name: ImmortalWrt N60 Pro 490MB
+          body: |
+            Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
+            分区布局：spi-nand-512MB-ubi-490MB（ubi 0x0580000 + 0x1ea00000）
+
+            默认地址：192.168.12.1  默认用户：root  默认密码：password
+            源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
+          artifacts: fw/490m/*
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show Summary
+        run: |
+          echo "506M:"
+          ls -l fw/506m || true
+          echo "490M:"
+          ls -l fw/490m || true
+          df -hT
