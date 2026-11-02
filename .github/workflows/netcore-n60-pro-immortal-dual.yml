@@ -239,10 +239,10 @@ jobs:
           echo "nproc = $(nproc)"
           make -j$(nproc) || make -j1 || make -j1 V=s
 
-      # 注意：这里必须按数值比对，不能拿期望值的字符串去 grep 反编译出来的 dts。
-      # dtc 输出的 reg 是十六进制（reg = <0x580000 0x1fa80000>），
-      # 用十进制串（531103744）grep 必然不匹配，会把编译正确的固件误判为失败。
-      - name: Verify DTS Partition (506M)
+      # 校验的是编译产物 DTB（$DTB_NAME），不是源码 DTS。
+      # dtc 反编译出来的 reg 是十六进制，且前导 0 会被规范化（0x0580000 -> 0x580000），
+      # 因此必须按数值比较，不能做字符串比较（用十进制串 grep 也必然不匹配）。
+      - name: Verify DTB Partition (506M)
         env:
           EXPECT_UBI_OFFSET: '0x0580000'
           EXPECT_UBI_SIZE: '0x1fa80000'
@@ -317,7 +317,7 @@ jobs:
           make -j$(nproc) target/linux/compile || make -j1 target/linux/compile V=s
           make -j$(nproc) target/install || make -j1 target/install V=s
 
-      - name: Verify DTS Partition (490M)
+      - name: Verify DTB Partition (490M)
         env:
           EXPECT_UBI_OFFSET: '0x0580000'
           EXPECT_UBI_SIZE: '0x1ea00000'
@@ -368,9 +368,10 @@ jobs:
       # 上传前最后一道关：两个变体的最终镜像必须真的不同
       - name: Verify Variants Differ
         run: |
-          IMG506=$(ls $GITHUB_WORKSPACE/fw/506m/*sysupgrade*.bin 2>/dev/null | head -1) || true
-          IMG490=$(ls $GITHUB_WORKSPACE/fw/490m/*sysupgrade*.bin 2>/dev/null | head -1) || true
-          [ -n "$IMG506" ] && [ -n "$IMG490" ] || { echo "ERROR: fw 目录里没找到 sysupgrade 镜像"; exit 1; }
+          # 本设备产物是 .itb（IMAGES := sysupgrade.itb），不能写死 .bin 扩展名
+          IMG506=$(ls $GITHUB_WORKSPACE/fw/506m/*sysupgrade* 2>/dev/null | head -1) || true
+          IMG490=$(ls $GITHUB_WORKSPACE/fw/490m/*sysupgrade* 2>/dev/null | head -1) || true
+          [ -n "$IMG506" ] && [ -n "$IMG490" ] || { echo "ERROR: fw 目录里没找到 sysupgrade 镜像"; ls -lR $GITHUB_WORKSPACE/fw; exit 1; }
           H506=$(sha256sum "$IMG506" | cut -d' ' -f1)
           H490=$(sha256sum "$IMG490" | cut -d' ' -f1)
           echo "506M: $(basename "$IMG506") ($(stat -c %s "$IMG506") bytes) $H506"
