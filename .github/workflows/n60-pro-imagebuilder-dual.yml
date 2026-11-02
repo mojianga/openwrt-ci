@@ -1,0 +1,396 @@
+name: n60-pro-imagebuilder-dual
+
+# 思路：
+#   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
+#   2) sing-box 仍然装 immortalwrt 的包（满足 momo 依赖、提供 init/config），但二进制用官方 release 覆盖
+#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs
+#   4) 改 dtb 的 ubi 分区为 506.5M / 490M，用官方同参数的 mkits.sh + mkimage 重打两个 itb
+#   5) 回填原 itb 尾部的 metadata，发布到两个 Release
+#
+# 触发方式：workflow_dispatch（可指定版本）或 点 star（watch: started，全部取 latest）
+# 注意：分区大小变了，刷机必须走 recovery initramfs，不能从旧系统直接 sysupgrade。
+
+on:
+  workflow_dispatch:
+    inputs:
+      easytier_version:
+        description: 'EasyTier tag（留空=latest）'
+        required: false
+        default: ''
+      meow_version:
+        description: 'meow tag（留空=latest）'
+        required: false
+        default: ''
+      singbox_version:
+        description: 'sing-box tag（留空=latest 稳定版）'
+        required: false
+        default: ''
+  # 点 star 触发；watch 事件只会触发「默认分支」上的 workflow
+  watch:
+    types: [started]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  IB_URL: https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic/immortalwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
+  PROFILE: netcore_n60-pro
+  PKG_ARCH: aarch64_cortex-a53
+  MOMO_REPO: https://momomomo.pages.dev/SNAPSHOT/aarch64_cortex-a53/momo
+  DEVICE_NAME: netcore-n60-pro
+  KERNEL_LOADADDR: '0x44080000'
+  UBI_506M: 0x0580000 0x1fa80000
+  UBI_490M: 0x0580000 0x1ea00000
+  TAG_506M: netcore-n60pro-ib-506m
+  TAG_490M: netcore-n60pro-ib-490m
+
+jobs:
+  build:
+    name: ImageBuilder N60 Pro (506M + 490M)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # workflow_dispatch 随时可跑；star 触发默认不限制触发人。
+    # 想在公开仓库里只允许特定账号点星触发，就配仓库变量 STAR_ACTOR=<用户名>，
+    # 配了之后只有该账号的 star 才会启动构建。
+    if: github.event_name == 'workflow_dispatch' || vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Prepare
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install zstd unzip device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev
+
+      - name: Download ImageBuilder
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o ib.tar.zst "$IB_URL"
+          ls -lh ib.tar.zst
+          tar --zstd -xf ib.tar.zst
+          IB=$(ls -d "$PWD"/immortalwrt-imagebuilder-*)
+          [ -d "$IB" ] || { echo "ERROR: 解压后没找到 ImageBuilder 目录"; ls -al; exit 1; }
+          echo "IB_DIR=$IB" >> $GITHUB_ENV
+          echo "ImageBuilder = $IB"
+          ls -a "$IB" | head -30
+
+      - name: Add momo apk repository
+        run: |
+          cd "$IB_DIR"
+          if [ -f repositories ]; then
+            REPO_FILE=repositories
+          elif [ -f repositories.conf ]; then
+            REPO_FILE=repositories.conf
+          else
+            echo "ERROR: 找不到 repositories / repositories.conf"; ls -a; exit 1
+          fi
+          case "$REPO_FILE" in
+            repositories)      echo "$MOMO_REPO" >> "$REPO_FILE" ;;
+            repositories.conf) echo "src/gz momo $MOMO_REPO" >> "$REPO_FILE" ;;
+          esac
+          mkdir -p keys
+          curl -fsSL --retry 3 https://momomomo.pages.dev/public-key.pem -o keys/momo.pem
+          echo "REPO_FILE=$REPO_FILE" >> $GITHUB_ENV
+          echo "--- $REPO_FILE ---"; cat "$REPO_FILE"
+          echo "--- keys ---"; ls -l keys
+
+      - name: Fetch EasyTier binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pkgs/et
+          TAG="${{ inputs.easytier_version }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                   https://api.github.com/repos/EasyTier/EasyTier/releases/latest \
+                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+          fi
+          echo "EasyTier tag = $TAG"
+          URL="https://github.com/EasyTier/EasyTier/releases/download/${TAG}/easytier-linux-aarch64-${TAG}.zip"
+          curl -fL --retry 3 -o pkgs/easytier.zip "$URL"
+          unzip -o -j pkgs/easytier.zip -d pkgs/et
+          ls -l pkgs/et
+          [ -f pkgs/et/easytier-core ] || { echo "ERROR: zip 里没有 easytier-core"; exit 1; }
+
+      - name: Fetch meow apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pkgs
+          TAG="${{ inputs.meow_version }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                   https://api.github.com/repos/meow-rs/meow-rs/releases/latest \
+                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+          fi
+          echo "meow tag = $TAG"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/meow-rs/meow-rs/releases/tags/${TAG}" > /tmp/meow.json
+          MEOW_URL=$(python3 - <<PY
+import json
+d = json.load(open('/tmp/meow.json'))
+a = [x['browser_download_url'] for x in d['assets']
+     if x['name'].startswith('meow_') and x['name'].endswith('_${PKG_ARCH}.apk')]
+print(a[0] if a else '')
+PY
+)
+          LUCI_URL=$(python3 - <<PY
+import json
+d = json.load(open('/tmp/meow.json'))
+a = [x['browser_download_url'] for x in d['assets']
+     if x['name'].startswith('luci-app-meow_') and x['name'].endswith('_all.apk')]
+print(a[0] if a else '')
+PY
+)
+          [ -n "$MEOW_URL" ] || { echo "ERROR: 没找到 meow 的 ${PKG_ARCH} apk"; exit 1; }
+          [ -n "$LUCI_URL" ] || { echo "ERROR: 没找到 luci-app-meow apk"; exit 1; }
+          echo "meow: $MEOW_URL"
+          echo "luci: $LUCI_URL"
+          curl -fL --retry 3 -o pkgs/meow.apk "$MEOW_URL"
+          curl -fL --retry 3 -o pkgs/luci-app-meow.apk "$LUCI_URL"
+          ls -lh pkgs/*.apk
+
+      - name: Fetch official sing-box (replace immortalwrt's old one)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pkgs
+          TAG="${{ inputs.singbox_version }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                   https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+          fi
+          VER=${TAG#v}
+          echo "sing-box tag = $TAG"
+          # 守卫：momo 要求 sing-box >= 1.12
+          python3 - "$VER" <<'PY'
+import sys
+v = sys.argv[1].split('-')[0]
+major, minor = map(int, v.split('.')[:2])
+assert (major, minor) >= (1, 12), f'sing-box {v} < 1.12，momo 不兼容'
+print(f'sing-box version check OK: {v}')
+PY
+          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64.tar.gz"
+          echo "URL=$URL"
+          curl -fL --retry 3 -o pkgs/sing-box.tar.gz "$URL"
+          tar -xzf pkgs/sing-box.tar.gz -C pkgs
+          BIN=$(find pkgs -type f -path "*sing-box-${VER}-linux-arm64/sing-box" | head -1)
+          [ -n "$BIN" ] || BIN=$(find pkgs -type f -name sing-box | head -1)
+          [ -n "$BIN" ] || { echo "ERROR: 解压后没找到 sing-box 二进制"; find pkgs -maxdepth 3; exit 1; }
+          install -m 0755 "$BIN" pkgs/sing-box-bin
+          echo "=== 二进制信息 ==="
+          file pkgs/sing-box-bin
+          case "$(file -b pkgs/sing-box-bin)" in
+            *aarch64*|*ARM*) echo "架构 OK" ;;
+            *) echo "ERROR: sing-box 二进制架构不对"; exit 1 ;;
+          esac
+          ls -lh pkgs/sing-box-bin
+
+      - name: Build FILES overlay (easytier + luci + i18n)
+        run: |
+          git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
+
+          mkdir -p files/usr/bin
+          cp -a pkgs/et/easytier-core pkgs/et/easytier-cli files/usr/bin/
+          if [ -f pkgs/et/easytier-web-embed ]; then
+            cp -a pkgs/et/easytier-web-embed files/usr/bin/easytier-web
+          elif [ -f pkgs/et/easytier-web ]; then
+            cp -a pkgs/et/easytier-web files/usr/bin/easytier-web
+          fi
+          chmod 0755 files/usr/bin/easytier-*
+
+          # 官方 sing-box 覆盖 immortalwrt 包里的旧二进制（FILES 在包安装之后拷贝）
+          install -D -m 0755 pkgs/sing-box-bin files/usr/bin/sing-box
+
+          # luci：luasrc -> /usr/lib/lua/luci，root -> /
+          mkdir -p files/usr/lib/lua/luci
+          cp -a et-src/luci-app-easytier/luasrc/. files/usr/lib/lua/luci/
+          cp -a et-src/luci-app-easytier/root/. files/
+          find files/etc -type f \( -name "*.sh" -o -path "files/etc/init.d/*" -o -path "files/etc/uci-defaults/*" \) -exec chmod 0755 {} +
+          chmod 0755 files/usr/bin/*
+
+          # 中文翻译：用 luci 官方 po2lmo 编译（ImageBuilder 不带这个工具）
+          git clone --depth 1 https://github.com/immortalwrt/luci.git luci-src
+          gcc -O2 -o /tmp/po2lmo luci-src/modules/luci-base/src/po2lmo.c
+          mkdir -p files/usr/lib/lua/luci/i18n
+          /tmp/po2lmo et-src/luci-app-easytier/po/zh_Hans/easytier.po \
+                     files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo
+          ls -l files/usr/lib/lua/luci/i18n/
+
+          # 默认中文界面
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-n60pro-lang <<'EOS'
+#!/bin/sh
+uci -q set luci.main.lang='zh_cn'
+uci -q commit luci
+exit 0
+EOS
+          chmod 0755 files/etc/uci-defaults/99-n60pro-lang
+
+          echo "===== FILES 预览 ====="
+          find files -type f | head -40
+
+      - name: Make image (base, 128M layout as material)
+        run: |
+          cd "$IB_DIR"
+          make image \
+            PROFILE="$PROFILE" \
+            FILES="$GITHUB_WORKSPACE/files" \
+            PACKAGES="luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn ca-bundle curl firewall4 ip-full kmod-tun kmod-dummy kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag sing-box momo luci-app-momo luci-i18n-momo-zh-cn $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          echo "===== 产物 ====="
+          ls -lh bin/targets/mediatek/filogic/
+
+      - name: Verify sing-box binary inside rootfs
+        run: |
+          ITB=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb | head -1)
+          cp "$ITB" base.itb
+          dumpimage -l base.itb | tee fit-base.txt
+          RFS_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Filesystem/{print pos; exit}' fit-base.txt)
+          echo "rootfs position = $RFS_POS"
+          dumpimage -T filesystem -p "$RFS_POS" -o rootfs.bin base.itb
+          unsquashfs -cat rootfs.bin usr/bin/sing-box > in-image-sing-box
+          WANT=$(sha256sum pkgs/sing-box-bin | cut -d' ' -f1)
+          GOT=$(sha256sum in-image-sing-box | cut -d' ' -f1)
+          echo "want = $WANT"
+          echo "got  = $GOT"
+          [ "$WANT" = "$GOT" ] || { echo "ERROR: 镜像里的 sing-box 不是官方二进制（FILES 覆盖没生效）"; exit 1; }
+          echo "OK: 镜像内 sing-box 已替换为官方版本"
+
+      - name: Extract FIT parts
+        run: |
+          ITB=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb | head -1)
+          cp "$ITB" base.itb
+          dumpimage -l base.itb | tee fit-base.txt
+          FDT_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' fit-base.txt)
+          KER_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Kernel Image/{print pos; exit}' fit-base.txt)
+          RFS_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Filesystem/{print pos; exit}' fit-base.txt)
+          echo "positions: kernel=$KER_POS fdt=$FDT_POS rootfs=$RFS_POS"
+          [ -n "$KER_POS" ] && [ -n "$FDT_POS" ] && [ -n "$RFS_POS" ] || { echo "ERROR: FIT 结构解析失败"; cat fit-base.txt; exit 1; }
+
+          dumpimage -T kernel     -p "$KER_POS" -o kernel.gz  base.itb
+          dumpimage -T flat_dt    -p "$FDT_POS" -o orig.dtb   base.itb
+          dumpimage -T filesystem -p "$RFS_POS" -o rootfs.bin base.itb
+          ls -lh kernel.gz orig.dtb rootfs.bin
+          dtc -I dtb -O dts orig.dtb -o orig.dts
+          grep -A3 'label = "ubi"' orig.dts
+
+      - name: Repack two itb with patched dtb
+        run: |
+          python3 - <<'PY'
+import re
+src = open('orig.dts').read()
+pat = re.compile(r'(label = "ubi";\s*reg = <)(0x[0-9a-fA-F]+)( )(0x[0-9a-fA-F]+)(>;)')
+m = pat.search(src)
+assert m, '未在 dts 中找到 ubi 分区 reg'
+print('原始 ubi reg: <%s %s>' % (m.group(2), m.group(4)))
+for name, off, size in (('506m', '0x0580000', '0x1fa80000'), ('490m', '0x0580000', '0x1ea00000')):
+    out = src[:m.start()] + m.group(1) + off + m.group(3) + size + m.group(5) + src[m.end():]
+    open('patched-%s.dts' % name, 'w').write(out)
+    print('生成 patched-%s.dts: <%s %s>' % (name, off, size))
+PY
+
+          for S in 506m 490m; do
+            dtc -I dts -O dtb -o dtb-$S.dtb patched-$S.dts
+            echo "--- dtb-$S.dtb ---"
+            dtc -I dtb -O dts dtb-$S.dtb | grep -A3 'label = "ubi"'
+
+            # 与官方完全一致的打包方式：mkits.sh + mkimage -E -B 0x1000 -p 0x1000
+            "$IB_DIR"/scripts/mkits.sh \
+              -D "$DEVICE_NAME" \
+              -o fit-$S.its \
+              -k kernel.gz \
+              -C gzip \
+              -d dtb-$S.dtb \
+              -r rootfs.bin \
+              -a "$KERNEL_LOADADDR" -e "$KERNEL_LOADADDR" \
+              -A arm64 -c config-1 -H sha256 \
+              -v "6.6"
+            mkimage -E -B 0x1000 -p 0x1000 -f fit-$S.its itb-$S.itb
+          done
+
+          # 回填原 itb 尾部的 metadata（内容只含设备名与版本，与分区无关）
+          python3 - <<'PY'
+src = open('base.itb', 'rb').read()
+i = src.find(b'{"metadata_version"')
+assert i > 0, '未在 base.itb 中找到 metadata JSON'
+meta = src[i:]
+print('metadata:', meta[:160])
+for s in ('506m', '490m'):
+    open('itb-%s.itb' % s, 'ab').write(meta)
+    print('itb-%s.itb += %d bytes' % (s, len(meta)))
+PY
+          ls -lh itb-506m.itb itb-490m.itb
+
+      - name: Verify itb
+        run: |
+          set -e
+          for S in 506m 490m; do
+            echo "======== itb-$S.itb ========"
+            dumpimage -l itb-$S.itb | tee fit-$S.txt
+            grep -q "Flat Device Tree" fit-$S.txt || { echo "ERROR: 缺少 dtb"; exit 1; }
+            grep -q "Filesystem"      fit-$S.txt || { echo "ERROR: 缺少 rootfs"; exit 1; }
+
+            POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' fit-$S.txt)
+            dumpimage -T flat_dt -p "$POS" -o check-$S.dtb itb-$S.itb
+            REG=$(dtc -I dtb -O dts check-$S.dtb | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
+            echo "ubi reg = <$REG>"
+            case "$S" in
+              506m) [ "$REG" = "$UBI_506M" ] || { echo "ERROR: 506M 分区不对"; exit 1; } ;;
+              490m) [ "$REG" = "$UBI_490M" ] || { echo "ERROR: 490M 分区不对"; exit 1; } ;;
+            esac
+          done
+
+          H506=$(sha256sum itb-506m.itb | cut -d' ' -f1)
+          H490=$(sha256sum itb-490m.itb | cut -d' ' -f1)
+          [ "$H506" != "$H490" ] || { echo "ERROR: 两个 itb 完全相同"; exit 1; }
+          echo "506M: $H506"
+          echo "490M: $H490"
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out/506m out/490m
+          BASE=immortalwrt-mediatek-filogic-netcore_n60-pro-squashfs-sysupgrade
+          cp -f itb-506m.itb "out/506m/${BASE}-506m.itb"
+          cp -f itb-490m.itb "out/490m/${BASE}-490m.itb"
+          ( cd out/506m && sha256sum * > sha256sums.txt )
+          ( cd out/490m && sha256sum * > sha256sums.txt )
+          ls -lR out
+
+      - name: Upload Firmware To Release (506M)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG_506M }}
+          name: ImmortalWrt N60 Pro ImageBuilder 506.5MB
+          body: |
+            Netcore N60 Pro / MT7986A / 512MB SPI NAND
+            ubi 分区：${{ env.UBI_506M }}
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
+            sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
+            刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
+          artifacts: out/506m/*
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Firmware To Release (490M)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.TAG_490M }}
+          name: ImmortalWrt N60 Pro ImageBuilder 490MB
+          body: |
+            Netcore N60 Pro / MT7986A / 512MB SPI NAND
+            ubi 分区：${{ env.UBI_490M }}
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
+            sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
+            刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
+          artifacts: out/490m/*
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
