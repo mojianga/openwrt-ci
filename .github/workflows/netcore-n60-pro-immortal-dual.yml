@@ -53,9 +53,10 @@ jobs:
   build:
     name: Build N60 Pro (506M + 490M)
     runs-on: ubuntu-24.04
-    # workflow_dispatch 随时可跑；watch（star 触发）必须显式配置 STAR_ACTOR，
-    # 否则任何人点星都会触发两遍完整编译（约数小时）
-    if: github.event_name == 'workflow_dispatch' || (vars.STAR_ACTOR != '' && github.actor == vars.STAR_ACTOR)
+    # workflow_dispatch 随时可跑；watch（star 触发）默认不限制触发人。
+    # 想在公开仓库里只允许特定账号点星触发，就配仓库变量 STAR_ACTOR=<用户名>，
+    # 配了之后只有该账号的 star 才会启动编译。
+    if: github.event_name == 'workflow_dispatch' || vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
     # 两遍编译（第二遍含增量重编）逼近 6h 默认上限，显式超时比被系统 kill 更好排查
     timeout-minutes: 350
 
