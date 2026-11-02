@@ -12,9 +12,10 @@ name: netcore-n60-pro-immortal-dual
 # 固件内容：预装 momo + easytier 本体及其中文 LuCI，其余代理工具（meow / nikki 等）不预装，
 # 只在 configs 里预置它们运行所需的 kmod 与用户态工具（见 configs 末尾的依赖清单）。
 #
-# 第三方包源（不走 feed，直接整仓 clone 到 package/ 下，见 Clone package 步骤）：
+# 第三方包源（不走 feed，整仓 clone 到 package/ 下，见 Clone Third-party Packages 步骤）：
 #   package/easytier <- https://github.com/EasyTier/luci-app-easytier
 #   package/momo     <- https://github.com/nikkinikki-org/OpenWrt-momo
+# 注意：必须在 Install Feeds 之后 clone——两个 luci-app-* 的 Makefile 要 include feeds/luci/luci.mk。
 #
 # 变体一致性：两个 Release 是分开的两次上传，中途被取消会出现 506m 新 / 490m 旧。
 # 因此上传前会校验两个镜像内容必须不同（见 Verify Variants Differ），并在结束时校验两目录非空。
@@ -67,7 +68,7 @@ jobs:
     # 想在公开仓库里只允许特定账号点星触发，就配仓库变量 STAR_ACTOR=<用户名>，
     # 配了之后只有该账号的 star 才会启动编译。
     if: github.event_name == 'workflow_dispatch' || vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
-    # 两遍编译（第二遍含增量重编）逼近 6h 默认上限，显式超时比被系统 kill 更好排查
+    # 两遍编译（第二遍只重建 kernel/dtb/镜像），显式超时比被系统 kill 更好排查
     timeout-minutes: 350
 
     steps:
@@ -116,22 +117,6 @@ jobs:
           # 只加明确定义的第三方 feed
           sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
 
-          # momo / easytier 不走 feed，直接整仓 clone 到 package/ 下：
-          # 两个仓库的根目录本身就是包集合，包在 package/<repo>/<pkg>/，正好是 OpenWrt 的扫描深度。
-          git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
-          git clone --depth 1 https://github.com/nikkinikki-org/OpenWrt-momo.git package/momo
-
-          # easytier 与 easytier-noweb 提供的是同一批可执行文件，二者互斥，只保留带 web 面板的 easytier
-          rm -rf package/easytier/easytier-noweb
-
-          # 目录结构变了就在这里炸掉，不要留到 make defconfig 时静默丢包
-          for d in package/easytier/easytier/Makefile \
-                   package/easytier/luci-app-easytier/Makefile \
-                   package/momo/momo/Makefile \
-                   package/momo/luci-app-momo/Makefile; do
-            [ -f "$d" ] || { echo "ERROR: 第三方包目录缺失 $d"; ls -R package/easytier package/momo 2>/dev/null | head -40; exit 1; }
-          done
-
       - name: Generate Variables
         run: |
           cp $CONFIG_FILE $OPENWRT_PATH/.config
@@ -171,6 +156,33 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # 必须放在 Install Feeds 之后：两个 luci-app-* 的 Makefile 要 include feeds/luci/luci.mk，
+      # 早于 feeds 安装会被扫描失败，且失败结果会缓存进 tmp/info，后面 feeds 装好了也不会自愈。
+      - name: Clone Third-party Packages
+        run: |
+          cd $OPENWRT_PATH
+          git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
+          git clone --depth 1 https://github.com/nikkinikki-org/OpenWrt-momo.git package/momo
+
+          # easytier 与 easytier-noweb 提供的是同一批可执行文件，二者互斥，只保留带 web 面板的 easytier
+          rm -rf package/easytier/easytier-noweb
+
+          # 目录结构变了就在这里炸掉，不要留到 make defconfig 时静默丢包
+          for d in package/easytier/easytier/Makefile \
+                   package/easytier/luci-app-easytier/Makefile \
+                   package/momo/momo/Makefile \
+                   package/momo/luci-app-momo/Makefile; do
+            [ -f "$d" ] || { echo "ERROR: 第三方包目录缺失 $d"; ls -R package/easytier package/momo 2>/dev/null | head -40; exit 1; }
+          done
+
+          # luci.mk 此时必须已存在，否则后面必然再丢 luci 包
+          [ -f feeds/luci/luci.mk ] || { echo "ERROR: feeds/luci/luci.mk 不存在，luci-app-* 无法解析"; ls feeds/luci | head; exit 1; }
+
+          # 关键：丢弃前面那次 make defconfig 生成的包索引缓存，强制重新扫描 package/ 与 feeds/
+          rm -rf tmp/info tmp/.config-package.in tmp/.packageinfo tmp/.packagedeps \
+                 tmp/.config-feeds.in tmp/.config-target.in
+          echo "包索引缓存已清理，下一次 make 会重新扫描"
+
       - name: Load Custom Configuration
         run: |
           cp -f $CONFIG_FILE $OPENWRT_PATH/.config
@@ -203,7 +215,17 @@ jobs:
           fi
           # 关键插件必须还在，否则说明 feeds / 第三方包源 / DIY 出了问题
           for sym in $MUST_KEEP_PACKAGES; do
-            grep -q "^${sym}=y" .config || { echo "ERROR: defconfig 后 ${sym} 丢失，请检查 feeds/DIY"; exit 1; }
+            if ! grep -q "^${sym}=y" .config; then
+              echo "ERROR: defconfig 后 ${sym} 丢失，请检查 feeds/DIY"
+              echo "---------- 诊断信息 ----------"
+              ls -l feeds/luci/luci.mk 2>/dev/null || echo "feeds/luci/luci.mk 不存在"
+              ls -d package/easytier/* package/momo/* 2>/dev/null || echo "第三方包目录缺失"
+              grep -n "^config PACKAGE_${sym#CONFIG_PACKAGE_}$" tmp/.config-package.in 2>/dev/null \
+                || echo "tmp/.config-package.in 中没有该符号（未被索引）"
+              grep -n "^config ${sym#CONFIG_}" tmp/.config-package.in 2>/dev/null || true
+              echo "------------------------------"
+              exit 1
+            fi
           done
 
           make download -j8 || make download -j1 V=s
@@ -288,7 +310,12 @@ jobs:
             exit 1
           }
 
-          make -j$(nproc) || make -j1 || make -j1 V=s
+          # 只重编内核（含 dtb）再重打镜像，不跑全量 make：
+          #   target/linux/compile -> 重建 dtb + kernel
+          #   target/install        -> 重新执行镜像打包（fit / sysupgrade.itb），rootfs 与软件包全部复用
+          echo "==================== 只重建 kernel + 镜像 ===================="
+          make -j$(nproc) target/linux/compile || make -j1 target/linux/compile V=s
+          make -j$(nproc) target/install || make -j1 target/install V=s
 
       - name: Verify DTS Partition (490M)
         env:
