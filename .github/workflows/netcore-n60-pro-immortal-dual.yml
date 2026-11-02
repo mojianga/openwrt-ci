@@ -191,16 +191,31 @@ jobs:
           echo "nproc = $(nproc)"
           make -j$(nproc) || make -j1 || make -j1 V=s
 
+      # 注意：这里必须按数值比对，不能拿期望值的字符串去 grep 反编译出来的 dts。
+      # dtc 输出的 reg 是十六进制（reg = <0x580000 0x1fa80000>），
+      # 用十进制串（531103744）grep 必然不匹配，会把编译正确的固件误判为失败。
       - name: Verify DTS Partition (506M)
         env:
-          EXPECT_UBI: 0x1fa80000
+          EXPECT_UBI_OFFSET: '0x0580000'
+          EXPECT_UBI_SIZE: '0x1fa80000'
         run: |
           cd $OPENWRT_PATH
           DTB=$(find build_dir -name "$DTB_NAME" 2>/dev/null | head -1) || true
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
-          dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
-          dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
-          echo "OK: ubi = $EXPECT_UBI"
+          DTS=$(dtc -I dtb -O dts "$DTB")
+          printf '%s\n' "$DTS" | grep -A3 'label = "ubi"'
+          REG=$(printf '%s\n' "$DTS" | grep -A3 'label = "ubi"' \
+                | sed -n 's/.*reg = <\([^>]*\)>.*/\1/p' | head -1)
+          [ -n "$REG" ] || { echo "ERROR: 无法从 dtb 中解析出 ubi 的 reg（节点结构可能变了）"; exit 1; }
+          set -- $REG
+          [ $# -ge 2 ] || { echo "ERROR: ubi reg 格式异常: <$REG>"; exit 1; }
+          OFF=$(( $1 )); SIZE=$(( $2 ))
+          EXP_OFF=$(( $EXPECT_UBI_OFFSET )); EXP_SIZE=$(( $EXPECT_UBI_SIZE ))
+          echo "ubi offset=$OFF ($(printf '0x%x' "$OFF")), size=$SIZE ($(printf '0x%x' "$SIZE"))"
+          echo "expect offset=$EXP_OFF ($EXPECT_UBI_OFFSET), size=$EXP_SIZE ($EXPECT_UBI_SIZE)"
+          [ "$OFF"  -eq "$EXP_OFF"  ] || { echo "ERROR: ubi offset 不是 $EXPECT_UBI_OFFSET（实际 $(printf '0x%x' "$OFF")）"; exit 1; }
+          [ "$SIZE" -eq "$EXP_SIZE" ] || { echo "ERROR: ubi size 不是 $EXPECT_UBI_SIZE（实际 $(printf '0x%x' "$SIZE")）"; exit 1; }
+          echo "OK: ubi = <$EXPECT_UBI_OFFSET $EXPECT_UBI_SIZE>"
           echo "DTB_SHA_506M=$(sha256sum "$DTB" | cut -d' ' -f1)" >> $GITHUB_ENV
 
       - name: Collect Firmware (506M)
@@ -251,14 +266,26 @@ jobs:
 
       - name: Verify DTS Partition (490M)
         env:
-          EXPECT_UBI: 0x1ea00000
+          EXPECT_UBI_OFFSET: '0x0580000'
+          EXPECT_UBI_SIZE: '0x1ea00000'
         run: |
           cd $OPENWRT_PATH
           DTB=$(find build_dir -name "$DTB_NAME" 2>/dev/null | head -1) || true
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
-          dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
-          dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
-          echo "OK: ubi = $EXPECT_UBI"
+          DTS=$(dtc -I dtb -O dts "$DTB")
+          printf '%s\n' "$DTS" | grep -A3 'label = "ubi"'
+          REG=$(printf '%s\n' "$DTS" | grep -A3 'label = "ubi"' \
+                | sed -n 's/.*reg = <\([^>]*\)>.*/\1/p' | head -1)
+          [ -n "$REG" ] || { echo "ERROR: 无法从 dtb 中解析出 ubi 的 reg（节点结构可能变了）"; exit 1; }
+          set -- $REG
+          [ $# -ge 2 ] || { echo "ERROR: ubi reg 格式异常: <$REG>"; exit 1; }
+          OFF=$(( $1 )); SIZE=$(( $2 ))
+          EXP_OFF=$(( $EXPECT_UBI_OFFSET )); EXP_SIZE=$(( $EXPECT_UBI_SIZE ))
+          echo "ubi offset=$OFF ($(printf '0x%x' "$OFF")), size=$SIZE ($(printf '0x%x' "$SIZE"))"
+          echo "expect offset=$EXP_OFF ($EXPECT_UBI_OFFSET), size=$EXP_SIZE ($EXPECT_UBI_SIZE)"
+          [ "$OFF"  -eq "$EXP_OFF"  ] || { echo "ERROR: ubi offset 不是 $EXPECT_UBI_OFFSET（实际 $(printf '0x%x' "$OFF")）"; exit 1; }
+          [ "$SIZE" -eq "$EXP_SIZE" ] || { echo "ERROR: ubi size 不是 $EXPECT_UBI_SIZE（实际 $(printf '0x%x' "$SIZE")）"; exit 1; }
+          echo "OK: ubi = <$EXPECT_UBI_OFFSET $EXPECT_UBI_SIZE>"
           # 与第一遍的 dtb 指纹对比，确保 dtb 真的重新生成了
           DTB_SHA_490M=$(sha256sum "$DTB" | cut -d' ' -f1)
           echo "dtb 506M: ${DTB_SHA_506M:-unknown}"
