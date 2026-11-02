@@ -3,12 +3,16 @@ name: netcore-n60pro-imagebuilder-dual
 # 思路：
 #   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
 #   2) sing-box 仍然装 immortalwrt 的包（满足 momo 依赖、提供 init/config），但二进制用官方 release 覆盖
-#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs
-#   4) 改 dtb 的 ubi 分区为 506.5M / 490M，用官方同参数的 mkits.sh + mkimage 重打两个 itb
-#   5) 回填原 itb 尾部的 metadata，发布到两个 Release
+#   3) 改 build_dir 里的 image-*.dtb 的 ubi 分区为 506.5M / 490M，再各跑一次 make image
+#   4) 让 ImageBuilder 自己重打 FIT（hash/load/压缩/metadata 全自动），校验后再发布
 #
 # 触发方式：workflow_dispatch（可指定版本）或 点 star（watch: started，全部取 latest）
-# 注意：分区大小变了，刷机必须走 recovery initramfs，不能从旧系统直接 sysupgrade。
+#
+# 注意（重要的刷机前提）：
+#   - 同分区间升级（506M -> 506M、490M -> 490M）可以直接 sysupgrade。
+#   - 跨分区（128M/506M/490M 之间互刷）必须用「目标分区表的内核」引导后刷写，
+#     而 ImageBuilder 不产出 initramfs/recovery 镜像；这种情况下请用 buildroot 版
+#     netcore-n60-pro-immortal-dual.yml 产出的 -recovery.itb 来刷，否则 UBI 会按旧分区边界创建。
 
 on:
   workflow_dispatch:
@@ -44,6 +48,7 @@ env:
   DEVICE_NAME: netcore-n60-pro
   UBI_506M: 0x0580000 0x1fa80000
   UBI_490M: 0x0580000 0x1ea00000
+  PKGS_BASE: luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn ca-bundle curl firewall4 ip-full kmod-tun kmod-dummy kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn sing-box momo luci-app-momo luci-i18n-momo-zh-cn
   TAG_506M: netcore-n60pro-ib-506m
   TAG_490M: netcore-n60pro-ib-490m
 
@@ -253,155 +258,103 @@ jobs:
           echo "===== FILES 预览 ====="
           find files -type f | head -40
 
-      - name: Make image (base, 128M layout as material)
+      - name: Make image (baseline, 128M layout)
         run: |
           cd "$IB_DIR"
-          make image \
-            PROFILE="$PROFILE" \
-            FILES="$GITHUB_WORKSPACE/files" \
-            PACKAGES="luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn ca-bundle curl firewall4 ip-full kmod-tun kmod-dummy kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn sing-box momo luci-app-momo luci-i18n-momo-zh-cn $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          PACKAGES="$PKGS_BASE $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
           echo "===== 产物 ====="
           ls -lh bin/targets/mediatek/filogic/
 
-      - name: Extract FIT parts and verify rootfs
+      # 不再手工拆 FIT：直接把改好的 dtb 放进 build_dir，让 ImageBuilder 自己重打镜像，
+      # hash / load 地址 / 压缩方式 / metadata 全部由官方规则处理（dumpimage 在该版本无法提取子镜像）
+      - name: Repack two itb (patch dtb + make image)
         run: |
-          ITB=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb | head -1)
-          cp "$ITB" base.itb
-          dumpimage -l base.itb | tee fit-base.txt
-          FDT_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' fit-base.txt)
-          KER_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Kernel Image/{print pos; exit}' fit-base.txt)
-          RFS_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Filesystem/{print pos; exit}' fit-base.txt)
-          echo "positions: kernel=$KER_POS fdt=$FDT_POS rootfs=$RFS_POS"
-          [ -n "$KER_POS" ] && [ -n "$FDT_POS" ] && [ -n "$RFS_POS" ] || { echo "ERROR: FIT 结构解析失败"; cat fit-base.txt; exit 1; }
+          cd "$IB_DIR"
+          PACKAGES="$PKGS_BASE $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
+          if [ -z "$DTB" ]; then
+            echo "build_dir 里没有 dtb，先跑一次 make image 生成"
+            make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
+            DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
+          fi
+          [ -n "$DTB" ] || { echo "ERROR: build_dir 里找不到 dtb"; find build_dir -name "*.dtb" | head; exit 1; }
+          echo "dtb = $DTB"
+          cp -f "$DTB" dtb.orig
+          dtc -I dtb -O dts dtb.orig -o dtb.orig.dts
+          grep -A3 'label = "ubi"' dtb.orig.dts
 
-          # 内核 load/entry 与版本必须从原 FIT 读，硬编码会在内核升级后失效（6.6 -> 6.18 地址已变）
-          KLOAD=$(awk '/Load Address:/{print $3; exit}' fit-base.txt)
-          KENTRY=$(awk '/Entry Point:/{print $3; exit}' fit-base.txt)
-          KVER=$(sed -n 's/.*OpenWrt Linux-\([0-9][0-9.]*\).*/\1/p' fit-base.txt | head -1)
-          KCOMP=$(awk '/Compression:/{print $2; exit}' fit-base.txt)
-          case "$KCOMP" in
-            gzip*)         KCOMP=gzip ;;
-            zstd*)         KCOMP=zstd ;;
-            xz*|lzma*)     KCOMP=lzma ;;
-            lzo*)          KCOMP=lzo ;;
-            bzip2*)        KCOMP=bzip2 ;;
-            uncompressed*) KCOMP=none ;;
-            *)             echo "ERROR: 未知内核压缩方式 '$KCOMP'"; cat fit-base.txt; exit 1 ;;
-          esac
-          KARCH=$(awk '/Architecture:/{print $2; exit}' fit-base.txt)
-          case "$KARCH" in
-            AArch64) KARCH=arm64 ;;
-            ARM)     KARCH=arm ;;
-            *)       echo "ERROR: 未知架构 '$KARCH'"; cat fit-base.txt; exit 1 ;;
-          esac
-          KCONF=$(sed -n "s/.*Default Configuration: '\([^']*\)'.*/\1/p" fit-base.txt | head -1)
-          [ -n "$KCONF" ] || KCONF=config-1
-          echo "kernel load=$KLOAD entry=$KENTRY version=$KVER comp=$KCOMP arch=$KARCH conf=$KCONF"
-          [ -n "$KLOAD" ] && [ -n "$KENTRY" ] || { echo "ERROR: 解析 kernel load/entry 失败"; cat fit-base.txt; exit 1; }
-          {
-            echo "KERNEL_LOADADDR=$KLOAD"
-            echo "KERNEL_ENTRY=$KENTRY"
-            echo "KERNEL_VER=$KVER"
-            echo "KERNEL_COMP=$KCOMP"
-            echo "KERNEL_ARCH=$KARCH"
-            echo "KERNEL_CONF=$KCONF"
-          } >> $GITHUB_ENV
-
-          # dumpimage 的 -T 是必需的（不带会报 unsupported type: Invalid Image），
-          # 但 -T filesystem 在 ubuntu 的 u-boot-tools 上不被识别，所以 rootfs 改用 squashfs magic 定位
-          dumpimage -T kernel  -p "$KER_POS" -o kernel.gz base.itb
-          dumpimage -T flat_dt -p "$FDT_POS" -o orig.dtb  base.itb
-
-          RFS_SIZE=$(awk -v want="$RFS_POS" '/Image [0-9]+ \(/{pos=$2} /Data Size:/{if (pos==want) {print $3; exit}}' fit-base.txt)
-          [ -n "$RFS_SIZE" ] || { echo "ERROR: 拿不到 rootfs 的 Data Size"; cat fit-base.txt; exit 1; }
-          FOUND=""
-          for CAND in $(grep -abo 'hsqs' base.itb | cut -d: -f1); do
-            tail -c +"$((CAND + 1))" base.itb | head -c "$RFS_SIZE" > rootfs.cand
-            if unsquashfs -s rootfs.cand > /dev/null 2>&1; then
-              mv rootfs.cand rootfs.bin
-              FOUND=$CAND
-              break
-            fi
-          done
-          rm -f rootfs.cand
-          [ -n "$FOUND" ] || { echo "ERROR: 在 itb 里找不到有效的 squashfs"; exit 1; }
-          echo "rootfs squashfs offset=$FOUND size=$RFS_SIZE"
-          unsquashfs -s rootfs.bin > /dev/null || { echo "ERROR: rootfs.bin 不是有效 squashfs"; exit 1; }
-          ls -lh kernel.gz orig.dtb rootfs.bin
-
-          # 顺带校验官方 sing-box 是否真的覆盖进了 rootfs
-          unsquashfs -cat rootfs.bin usr/bin/sing-box > in-image-sing-box
-          WANT=$(sha256sum pkgs/sing-box-bin | cut -d' ' -f1)
-          GOT=$(sha256sum in-image-sing-box | cut -d' ' -f1)
-          echo "sing-box want=$WANT got=$GOT"
-          [ "$WANT" = "$GOT" ] || { echo "ERROR: 镜像里的 sing-box 不是官方二进制（FILES 覆盖没生效）"; exit 1; }
-
-          dtc -I dtb -O dts orig.dtb -o orig.dts
-          grep -A3 'label = "ubi"' orig.dts
-
-      - name: Patch dtb for two partitions
-        run: |
           for PAIR in "506m 0x0580000 0x1fa80000" "490m 0x0580000 0x1ea00000"; do
             set -- $PAIR
             NAME="$1"
             OFF="$2"
             SIZE="$3"
+            # 不依赖 label/reg 先后顺序：先定位 label = "ubi" 的行，再在附近找 reg
             awk -v off="$OFF" -v size="$SIZE" '
-              /label = "ubi";/ { hit = 1 }
-              hit && /reg = </ {
-                sub(/reg = <0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+>/, "reg = <" off " " size ">")
-                hit = 0
+              { lines[NR] = $0 }
+              /label = "ubi";/ { ubi = NR }
+              END {
+                if (!ubi) { print "ERROR: dts 中找不到 label = ubi" > "/dev/stderr"; exit 1 }
+                done = 0
+                for (i = ubi - 6; i <= ubi + 6; i++) {
+                  if (i in lines && lines[i] ~ /reg = </) {
+                    if (!sub(/reg = <0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+>/, "reg = <" off " " size ">", lines[i])) {
+                      print "ERROR: ubi reg 格式不认识: " lines[i] > "/dev/stderr"; exit 1
+                    }
+                    done = 1
+                    break
+                  }
+                }
+                if (!done) { print "ERROR: ubi 节点附近找不到 reg" > "/dev/stderr"; exit 1 }
+                for (i = 1; i <= NR; i++) print lines[i]
               }
-              { print }
-            ' orig.dts > "patched-$NAME.dts"
-            grep -A3 'label = "ubi"' "patched-$NAME.dts"
+            ' dtb.orig.dts > "patched-$NAME.dts"
             dtc -I dts -O dtb -o "dtb-$NAME.dtb" "patched-$NAME.dts"
             echo "--- dtb-$NAME.dtb ---"
             dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"'
-          done
 
-      - name: Repack two itb with patched dtb
-        run: |
-          for S in 506m 490m; do
-            # 参数全部来自原 FIT：load/entry/压缩/架构/config 名，内核升级后无需改脚本
-            # 不加 -H：mkits.sh 默认 sha1，与原 FIT 一致，U-Boot 必定支持（sha256 未必编译进去）
-            "$IB_DIR"/scripts/mkits.sh \
-              -D "$DEVICE_NAME" \
-              -o "fit-$S.its" \
-              -k kernel.gz \
-              -C "$KERNEL_COMP" \
-              -d "dtb-$S.dtb" \
-              -r rootfs.bin \
-              -a "$KERNEL_LOADADDR" -e "$KERNEL_ENTRY" \
-              -A "$KERNEL_ARCH" -c "$KERNEL_CONF" \
-              -v "${KERNEL_VER:-6.6}"
-            mkimage -E -B 0x1000 -p 0x1000 -f "fit-$S.its" "itb-$S.itb"
-          done
+            # 断言：dtc 反编译会把前导 0 去掉（0x0580000 -> 0x580000），所以必须按数值比较
+            REG=$(dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
+            echo "ubi reg = <$REG>"
+            set -- $REG
+            [ $# -ge 2 ] || { echo "ERROR: 解析 dtb 里的 ubi reg 失败"; exit 1; }
+            [ "$(( $1 ))" -eq "$(( OFF ))" ] && [ "$(( $2 ))" -eq "$(( SIZE ))" ] \
+              || { echo "ERROR: dtb-$NAME 分区不对，期望 <$OFF $SIZE> 实际 <$REG>"; exit 1; }
 
-          # 回填原 itb 尾部的 metadata（只含设备名与版本，与分区无关）
-          OFFSET=$(grep -abo '{"metadata_version"' base.itb | head -1 | cut -d: -f1)
-          echo "metadata offset = $OFFSET"
-          [ -n "$OFFSET" ] || { echo "ERROR: base.itb 里没有 metadata"; exit 1; }
-          for S in 506m 490m; do
-            tail -c +"$((OFFSET + 1))" base.itb >> "itb-$S.itb"
+            cp -f "dtb-$NAME.dtb" "$DTB"
+            rm -f bin/targets/mediatek/filogic/*sysupgrade.itb
+            make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
+            NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1)
+            [ -n "$NEW" ] || { echo "ERROR: 没有产出 sysupgrade.itb"; ls -l bin/targets/mediatek/filogic; exit 1; }
+            cp -f "$NEW" "itb-$NAME.itb"
+            ls -lh "itb-$NAME.itb"
+
+            # 校验 FILES 覆盖是否生效：ImageBuilder 的 TARGET_DIR 在 make image 后仍保留
+            TARGET=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
+            if [ -n "$TARGET" ] && [ -f "$TARGET/usr/bin/sing-box" ]; then
+              IN_SHA=$(sha256sum "$TARGET/usr/bin/sing-box" | cut -d' ' -f1)
+              WANT_SHA=$(sha256sum "$GITHUB_WORKSPACE/pkgs/sing-box-bin" | cut -d' ' -f1)
+              echo "rootfs sing-box sha256 = $IN_SHA"
+              [ "$IN_SHA" = "$WANT_SHA" ] \
+                || { echo "ERROR: rootfs 里的 sing-box 不是官方二进制（FILES 覆盖没生效）"; exit 1; }
+            else
+              echo "WARNING: 找不到 TARGET_DIR（$TARGET），跳过 sing-box 覆盖校验"
+            fi
           done
-          ls -lh itb-506m.itb itb-490m.itb
 
       - name: Verify itb
         run: |
+          cd "$IB_DIR"
           for S in 506m 490m; do
             echo "======== itb-$S.itb ========"
             dumpimage -l "itb-$S.itb" | tee "fit-$S.txt"
             grep -q "Flat Device Tree" "fit-$S.txt" || { echo "ERROR: 缺少 dtb"; exit 1; }
             grep -q "Filesystem" "fit-$S.txt" || { echo "ERROR: 缺少 rootfs"; exit 1; }
-            POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' "fit-$S.txt")
-            dumpimage -p "$POS" -o "check-$S.dtb" "itb-$S.itb"
-            REG=$(dtc -I dtb -O dts "check-$S.dtb" | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
-            echo "ubi reg = <$REG>"
-            case "$S" in
-              506m) [ "$REG" = "$UBI_506M" ] || { echo "ERROR: 506M 分区不对，期望 <$UBI_506M>"; exit 1; } ;;
-              490m) [ "$REG" = "$UBI_490M" ] || { echo "ERROR: 490M 分区不对，期望 <$UBI_490M>"; exit 1; } ;;
-            esac
+            FDT_SHA=$(awk '/Image [0-9]+ \(/{img=$0} /Hash value:/{if (img ~ /fdt-1/ && prev ~ /sha1/) {print $3; exit}} {prev=$0}' "fit-$S.txt")
+            LOCAL_SHA=$(sha1sum "dtb-$S.dtb" | cut -d' ' -f1)
+            echo "fdt sha1 in itb = $FDT_SHA"
+            echo "local dtb sha1  = $LOCAL_SHA"
+            [ -n "$FDT_SHA" ] && [ "$FDT_SHA" = "$LOCAL_SHA" ] || { echo "ERROR: itb 里的 dtb 不是我们改的那份"; exit 1; }
           done
           H506=$(sha256sum itb-506m.itb | cut -d' ' -f1)
           H490=$(sha256sum itb-490m.itb | cut -d' ' -f1)
@@ -411,13 +364,13 @@ jobs:
 
       - name: Collect artifacts
         run: |
-          mkdir -p out/506m out/490m
+          mkdir -p "$GITHUB_WORKSPACE/out/506m" "$GITHUB_WORKSPACE/out/490m"
           BASE=immortalwrt-mediatek-filogic-netcore_n60-pro-squashfs-sysupgrade
-          cp -f itb-506m.itb "out/506m/${BASE}-506m.itb"
-          cp -f itb-490m.itb "out/490m/${BASE}-490m.itb"
-          ( cd out/506m && sha256sum * > sha256sums.txt )
-          ( cd out/490m && sha256sum * > sha256sums.txt )
-          ls -lR out
+          cp -f "$IB_DIR/itb-506m.itb" "$GITHUB_WORKSPACE/out/506m/${BASE}-506m.itb"
+          cp -f "$IB_DIR/itb-490m.itb" "$GITHUB_WORKSPACE/out/490m/${BASE}-490m.itb"
+          ( cd "$GITHUB_WORKSPACE/out/506m" && sha256sum * > sha256sums.txt )
+          ( cd "$GITHUB_WORKSPACE/out/490m" && sha256sum * > sha256sums.txt )
+          ls -lR "$GITHUB_WORKSPACE/out"
 
       - name: Upload Firmware To Release (506M)
         uses: ncipollo/release-action@v1
@@ -427,9 +380,11 @@ jobs:
           body: |
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_506M }}
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
+            默认地址：192.168.12.1
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
+            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
             sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
-            刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
+            刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
           artifacts: out/506m/*
           allowUpdates: true
           removeArtifacts: true
@@ -443,9 +398,11 @@ jobs:
           body: |
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_490M }}
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
+            默认地址：192.168.12.1
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
+            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
             sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
-            刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
+            刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
           artifacts: out/490m/*
           allowUpdates: true
           removeArtifacts: true
