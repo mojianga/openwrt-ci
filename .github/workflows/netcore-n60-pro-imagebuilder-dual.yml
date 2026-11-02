@@ -92,8 +92,9 @@ jobs:
             ls -a
             exit 1
           fi
+          # apk 3 的仓库条目要指向索引文件本身（写目录会被拼成 <dir>/<arch>/APKINDEX.tar.gz）
           case "$REPO_FILE" in
-            repositories)      echo "$MOMO_REPO" >> "$REPO_FILE" ;;
+            repositories)      echo "$MOMO_REPO/packages.adb" >> "$REPO_FILE" ;;
             repositories.conf) echo "src/gz momo $MOMO_REPO" >> "$REPO_FILE" ;;
           esac
           mkdir -p keys
@@ -103,6 +104,16 @@ jobs:
           cat "$REPO_FILE"
           echo "--- keys ---"
           ls -l keys
+
+      - name: Allow untrusted apk (meow 的 apk 没有公钥)
+        run: |
+          cd "$IB_DIR"
+          cp Makefile Makefile.orig
+          # ImageBuilder 的 package_install 实际执行：
+          #   $(APK) add --arch $(ARCH_PACKAGES) --no-scripts $(BUILD_PACKAGES)
+          sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
+          grep -n "PK) add" Makefile
+          grep -q "allow-untrusted" Makefile || { echo "ERROR: 没能给 apk add 加上 --allow-untrusted"; sed -n '255,275p' Makefile; exit 1; }
 
       - name: Fetch EasyTier binaries
         env:
@@ -186,6 +197,7 @@ jobs:
             *) echo "ERROR: sing-box 二进制架构不对"; exit 1 ;;
           esac
           ls -lh pkgs/sing-box-bin
+
       - name: Build FILES overlay (easytier + luci + i18n)
         run: |
           git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
