@@ -1,6 +1,13 @@
 name: netcore-n60pro-immortal-dual
 
-# 单 job 出两种分区固件：先按 506.5MB 完整编译，改 DTS 后仅重建 dtb/kernel/镜像出 490MB
+# 单 job 出两种分区固件：
+#   1) 用 netcore-n60pro-immortal-506m.sh 做 DIY，完整编译产出 506.5MB 固件
+#   2) 复用已编译的工具链 / 软件包，只把 DTS 的 ubi 改成 490MB，重建 dtb/kernel/镜像
+#
+# 文件分工（避免混淆）：
+#   DIY_SCRIPT = netcore-n60pro-immortal-506m.sh   可执行，本 workflow 唯一会跑的 DIY 脚本
+#   DIY_LIB    = netcore-n60pro-diy-lib.sh        函数库，只被 source（换 golang/装 meow/装 easytier/改 DTS）
+#   netcore-n60pro-immortal-490m.sh               可执行，仅供单独构建 490MB 时用，本 workflow 不执行它
 # 前置要求：configs/netcore-n60pro-immortal.config 里不能有 CONFIG_IB / CONFIG_SDK
 
 on:
@@ -20,9 +27,11 @@ env:
   REPO_BRANCH: master
   CONFIG_FILE: configs/netcore-n60pro-immortal.config
   DIY_SCRIPT: netcore-n60pro-immortal-506m.sh
+  DIY_LIB: netcore-n60pro-diy-lib.sh
   CACHE_TOOLCHAIN: 'true'
   TZ: Asia/Shanghai
   DTS_PATH: target/linux/mediatek/dts/mt7986a-netcore-n60-pro.dts
+  DTB_NAME: image-mt7986a-netcore-n60-pro.dtb
   UBI_506M: 0x0580000 0x1fa80000
   UBI_490M: 0x0580000 0x1ea00000
   TAG_506M: netcore-n60pro-immortal-506m
@@ -40,8 +49,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get -y update
-          sudo -E apt-get -y install $(curl -fsSL ophub.org/ubuntu2404-make-openwrt-depends)
-          sudo -E apt-get -y install device-tree-compiler
+          sudo -E apt-get -y install $(curl -fsSL --retry 3 ophub.org/ubuntu2404-make-openwrt-depends)
+          sudo -E apt-get -y install device-tree-compiler unzip
           sudo timedatectl set-timezone "$TZ"
           sudo systemctl daemon-reload
 
@@ -63,21 +72,21 @@ jobs:
 
       - name: Verify Repo Files
         run: |
-          test -f "$CONFIG_FILE" || { echo "ERROR: 缺少 $CONFIG_FILE"; ls -al; exit 1; }
-          test -f "$DIY_SCRIPT" || { echo "ERROR: 缺少 $DIY_SCRIPT"; ls -al; exit 1; }
+          for f in "$CONFIG_FILE" "$DIY_SCRIPT" "$DIY_LIB"; do
+            [ -f "$f" ] || { echo "ERROR: 缺少 $f"; ls -al; exit 1; }
+          done
 
       - name: Clone Source Code
         run: |
           git clone $REPO_URL -b $REPO_BRANCH openwrt
           echo "OPENWRT_PATH=$PWD/openwrt" >> $GITHUB_ENV
-          cd openwrt
-          echo "SOURCE_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "SOURCE_DATE=$(git show -s --date=short --format=%cd)" >> $GITHUB_ENV
+          echo "SOURCE_COMMIT=$(git -C openwrt rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "SOURCE_DATE=$(git -C openwrt show -s --date=short --format=%cd)" >> $GITHUB_ENV
 
       - name: Clone package
         run: |
           cd openwrt
-          sed -i '1i src-git easytier https://github.com/EasyTier/luci-app-easytier.git;main' feeds.conf.default
+          # easytier 不再走 feed 源码编译，改为内嵌官方预编译 apk（见 netcore-n60pro-diy-lib.sh）
           sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
           sed -i '1i src-git momo https://github.com/nikkinikki-org/OpenWrt-momo.git;main' feeds.conf.default
 
@@ -88,8 +97,8 @@ jobs:
           make defconfig > /dev/null 2>&1
 
           echo "SOURCE_REPO=$(echo $REPO_URL | awk -F '/' '{print $(NF)}')" >> $GITHUB_ENV
-          echo "DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
-          echo "DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
+          echo "DEVICE_TARGET=$(grep '^CONFIG_TARGET_BOARD' .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
+          echo "DEVICE_SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET' .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
 
           # 守卫 1：CONFIG_IB=y 会让 subtarget 下所有设备内核都参与构建（会把 keenetic_kn-1012 拉进来并因缺 u-boot.bin 失败）
           if grep -q '^CONFIG_IB=y' .config; then
@@ -97,8 +106,7 @@ jobs:
             exit 1
           fi
           # 守卫 2：必须且只能是 netcore_n60-pro 一个设备
-          DEV_NUM=$(grep -c '^CONFIG_TARGET_[a-z0-9_]*_DEVICE_.*=y$' .config || true)
-          echo "selected device count = $DEV_NUM"
+          echo "selected device count = $(grep -c '^CONFIG_TARGET_[a-z0-9_]*_DEVICE_.*=y$' .config || true)"
           if ! grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_netcore_n60-pro=y' .config; then
             echo "ERROR: 未选中 netcore_n60-pro"
             exit 1
@@ -122,9 +130,11 @@ jobs:
       - name: Load Custom Configuration
         run: |
           cp -f $CONFIG_FILE $OPENWRT_PATH/.config
+          # 合并 pppoe-files 到 files/（用 cp -a 而不是 mv，避免 files/ 已存在时嵌套一层）
           if [ -d pppoe-files ]; then
-            chmod +x pppoe-files/* || true
-            mv pppoe-files $OPENWRT_PATH/files
+            mkdir -p $OPENWRT_PATH/files
+            cp -a pppoe-files/. $OPENWRT_PATH/files/
+            chmod +x $OPENWRT_PATH/files/* 2>/dev/null || true
           fi
 
       - name: Mod Script
@@ -149,65 +159,80 @@ jobs:
           make -j$(nproc) || make -j1 || make -j1 V=s
 
       - name: Verify DTS Partition (506M)
+        env:
+          EXPECT_UBI: 0x1fa80000
         run: |
           cd $OPENWRT_PATH
-          DTB=$(find build_dir -name 'image-mt7986a-netcore-n60-pro.dtb' | head -1)
+          DTB=$(find build_dir -name "$DTB_NAME" | head -1)
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
           dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
-          dtc -I dtb -O dts "$DTB" | grep -qi "0x1fa80000" || { echo "ERROR: ubi 分区不是 506.5MB"; exit 1; }
+          dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
+          echo "OK: ubi = $EXPECT_UBI"
 
       - name: Collect Firmware (506M)
+        env:
+          SIZE: 506m
         run: |
           cd $OPENWRT_PATH
-          OUT=$GITHUB_WORKSPACE/fw/506m
-          mkdir -p $OUT
+          OUT=$GITHUB_WORKSPACE/fw/$SIZE
+          rm -rf "$OUT"; mkdir -p "$OUT"
           shopt -s nullglob
+          n=0
           for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
             base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
-            cp -f "$f" "$OUT/${stem}-506m.${ext}"
+            cp -f "$f" "$OUT/${stem}-${SIZE}.${ext}"
+            n=$((n + 1))
           done
-          cp -f .config $OUT/build-506m.config || true
-          ( cd $OUT && sha256sum * > sha256sums-506m.txt )
-          ls -l $OUT
+          [ "$n" -gt 0 ] || { echo "ERROR: 未收集到固件"; ls -l bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET || true; exit 1; }
+          cp -f .config "$OUT/build-${SIZE}.config" || true
+          ( cd "$OUT" && sha256sum * > "sha256sums-${SIZE}.txt" )
+          ls -l "$OUT"
 
       # ============ 第二遍：只改 DTS，复用已编译的工具链/软件包 ============
       - name: Rebuild Firmware (490M)
         run: |
           cd $OPENWRT_PATH
-          grep -qF "$UBI_506M" $DTS_PATH || { echo "ERROR: 未找到 506M 分区定义，上游 DTS 可能已变更"; exit 1; }
-          sed -i "s/$UBI_506M/$UBI_490M/" $DTS_PATH
+          # 复用 DIY 公共库的分区替换逻辑（幂等：已是目标分区则跳过）
+          source "$GITHUB_WORKSPACE/$DIY_LIB"
+          n60pro_patch_ubi "$UBI_490M" "$UBI_506M" "$DTS_PATH"
           echo "==================== DTS 已切换为 490M ===================="
-          grep -n -A3 'label = "ubi"' $DTS_PATH
 
           # 只删掉与 dtb / 设备 kernel 相关的产物，强制重新生成（vmlinux、软件包全部复用）
-          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/image-mt7986a-netcore_n60-pro.dtb
-          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/image-mt7986a-netcore-n60-pro.dtb
-          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/netcore_n60-pro-kernel.bin
-          rm -f build_dir/target-*/linux-${DEVICE_TARGET}_${DEVICE_SUBTARGET}/linux-*/arch/arm64/boot/dts/mediatek/mt7986a-netcore-n60-pro.dtb
+          find build_dir -type f -name "image-mt7986a-netcore*n60-pro.dtb" -delete
+          find build_dir -type f -name 'netcore_n60-pro-kernel.bin' -delete
+          find build_dir -type f -path '*arch/arm64/boot/dts/mediatek/mt7986a-netcore-n60-pro.dtb' -delete
 
           make -j$(nproc) || make -j1 || make -j1 V=s
 
       - name: Verify DTS Partition (490M)
+        env:
+          EXPECT_UBI: 0x1ea00000
         run: |
           cd $OPENWRT_PATH
-          DTB=$(find build_dir -name 'image-mt7986a-netcore-n60-pro.dtb' | head -1)
+          DTB=$(find build_dir -name "$DTB_NAME" | head -1)
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
           dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
-          dtc -I dtb -O dts "$DTB" | grep -qi "0x1ea00000" || { echo "ERROR: ubi 分区不是 490MB"; exit 1; }
+          dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
+          echo "OK: ubi = $EXPECT_UBI"
 
       - name: Collect Firmware (490M)
+        env:
+          SIZE: 490m
         run: |
           cd $OPENWRT_PATH
-          OUT=$GITHUB_WORKSPACE/fw/490m
-          mkdir -p $OUT
+          OUT=$GITHUB_WORKSPACE/fw/$SIZE
+          rm -rf "$OUT"; mkdir -p "$OUT"
           shopt -s nullglob
+          n=0
           for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
             base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
-            cp -f "$f" "$OUT/${stem}-490m.${ext}"
+            cp -f "$f" "$OUT/${stem}-${SIZE}.${ext}"
+            n=$((n + 1))
           done
-          cp -f .config $OUT/build-490m.config || true
-          ( cd $OUT && sha256sum * > sha256sums-490m.txt )
-          ls -l $OUT
+          [ "$n" -gt 0 ] || { echo "ERROR: 未收集到固件"; ls -l bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET || true; exit 1; }
+          cp -f .config "$OUT/build-${SIZE}.config" || true
+          ( cd "$OUT" && sha256sum * > "sha256sums-${SIZE}.txt" )
+          ls -l "$OUT"
 
       - name: Upload Firmware To Release (506M)
         uses: ncipollo/release-action@v1
@@ -243,8 +268,10 @@ jobs:
 
       - name: Show Summary
         run: |
-          echo "506M:"
-          ls -l fw/506m || true
-          echo "490M:"
-          ls -l fw/490m || true
+          for d in fw/506m fw/490m; do
+            echo "===== $d ====="
+            ls -l "$d" || true
+          done
+          # 两次产物必须都存在，避免“编译成功但固件缺失”
+          [ -n "$(ls -A fw/506m)" ] && [ -n "$(ls -A fw/490m)" ]
           df -hT
