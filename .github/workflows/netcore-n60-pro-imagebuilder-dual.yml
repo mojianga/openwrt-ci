@@ -3,7 +3,7 @@ name: netcore-n60pro-imagebuilder-dual
 # 思路：
 #   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
 #   2) sing-box 仍然装 immortalwrt 的包（满足 momo 依赖、提供 init/config），但二进制用官方 release 覆盖
-#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs（load/entry/内核版本都从 FIT 里动态读）
+#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs，load/entry/版本/压缩/架构全部从 FIT 动态解析
 #   4) 改 dtb 的 ubi 分区为 506.5M / 490M，用官方同参数的 mkits.sh + mkimage 重打两个 itb
 #   5) 回填原 itb 尾部的 metadata，发布到两个 Release
 #
@@ -274,16 +274,38 @@ jobs:
           echo "positions: kernel=$KER_POS fdt=$FDT_POS rootfs=$RFS_POS"
           [ -n "$KER_POS" ] && [ -n "$FDT_POS" ] && [ -n "$RFS_POS" ] || { echo "ERROR: FIT 结构解析失败"; cat fit-base.txt; exit 1; }
 
-          # 内核 load/entry 与版本必须从原 FIT 读，硬编码会在内核升级后失效（6.6 -> 6.18 地址已变）
+          # 内核 load/entry、版本、压缩方式、架构、config 名全部从原 FIT 读，
+          # 内核或打包方式升级后这里不需要改（6.6 -> 6.18 的地址变化已经踩过一次）
           KLOAD=$(awk '/Load Address:/{print $3; exit}' fit-base.txt)
           KENTRY=$(awk '/Entry Point:/{print $3; exit}' fit-base.txt)
           KVER=$(sed -n 's/.*OpenWrt Linux-\([0-9][0-9.]*\).*/\1/p' fit-base.txt | head -1)
-          echo "kernel load=$KLOAD entry=$KENTRY version=$KVER"
+          KCOMP=$(awk '/Compression:/{print $2; exit}' fit-base.txt)
+          case "$KCOMP" in
+            gzip*)         KCOMP=gzip ;;
+            zstd*)         KCOMP=zstd ;;
+            xz*|lzma*)     KCOMP=lzma ;;
+            lzo*)          KCOMP=lzo ;;
+            bzip2*)        KCOMP=bzip2 ;;
+            uncompressed*) KCOMP=none ;;
+            *)             echo "ERROR: 未知内核压缩方式 '$KCOMP'"; cat fit-base.txt; exit 1 ;;
+          esac
+          KARCH=$(awk '/Architecture:/{print $2; exit}' fit-base.txt)
+          case "$KARCH" in
+            AArch64) KARCH=arm64 ;;
+            ARM)     KARCH=arm ;;
+            *)       echo "ERROR: 未知架构 '$KARCH'"; cat fit-base.txt; exit 1 ;;
+          esac
+          KCONF=$(sed -n "s/.*Default Configuration: '\([^']*\)'.*/\1/p" fit-base.txt | head -1)
+          [ -n "$KCONF" ] || KCONF=config-1
+          echo "kernel load=$KLOAD entry=$KENTRY version=$KVER comp=$KCOMP arch=$KARCH conf=$KCONF"
           [ -n "$KLOAD" ] && [ -n "$KENTRY" ] || { echo "ERROR: 解析 kernel load/entry 失败"; cat fit-base.txt; exit 1; }
           {
             echo "KERNEL_LOADADDR=$KLOAD"
             echo "KERNEL_ENTRY=$KENTRY"
             echo "KERNEL_VER=$KVER"
+            echo "KERNEL_COMP=$KCOMP"
+            echo "KERNEL_ARCH=$KARCH"
+            echo "KERNEL_CONF=$KCONF"
           } >> $GITHUB_ENV
 
           # 按 position 提取，不要加 -T：dumpimage 对 filesystem 类型会做类型校验并直接失败
@@ -334,16 +356,17 @@ jobs:
       - name: Repack two itb with patched dtb
         run: |
           for S in 506m 490m; do
-            # 与官方完全一致的打包方式：mkits.sh + mkimage -E -B 0x1000 -p 0x1000
+            # 参数全部来自原 FIT：load/entry/压缩/架构/config 名，内核升级后无需改脚本
+            # 不加 -H：mkits.sh 默认 sha1，与原 FIT 一致，U-Boot 必定支持（sha256 未必编译进去）
             "$IB_DIR"/scripts/mkits.sh \
               -D "$DEVICE_NAME" \
               -o "fit-$S.its" \
               -k kernel.gz \
-              -C gzip \
+              -C "$KERNEL_COMP" \
               -d "dtb-$S.dtb" \
               -r rootfs.bin \
               -a "$KERNEL_LOADADDR" -e "$KERNEL_ENTRY" \
-              -A arm64 -c config-1 -H sha256 \
+              -A "$KERNEL_ARCH" -c "$KERNEL_CONF" \
               -v "${KERNEL_VER:-6.6}"
             mkimage -E -B 0x1000 -p 0x1000 -f "fit-$S.its" "itb-$S.itb"
           done
