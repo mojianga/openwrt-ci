@@ -289,27 +289,16 @@ jobs:
             NAME="$1"
             OFF="$2"
             SIZE="$3"
-            # 不依赖 label/reg 先后顺序：先定位 label = "ubi" 的行，再在附近找 reg
-            awk -v off="$OFF" -v size="$SIZE" '
-              { lines[NR] = $0 }
-              /label = "ubi";/ { ubi = NR }
-              END {
-                if (!ubi) { print "ERROR: dts 中找不到 label = ubi" > "/dev/stderr"; exit 1 }
-                done = 0
-                for (i = ubi - 6; i <= ubi + 6; i++) {
-                  if (i in lines && lines[i] ~ /reg = </) {
-                    if (!sub(/reg = <0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+>/, "reg = <" off " " size ">", lines[i])) {
-                      print "ERROR: ubi reg 格式不认识: " lines[i] > "/dev/stderr"; exit 1
-                    }
-                    done = 1
-                    break
-                  }
-                }
-                if (!done) { print "ERROR: ubi 节点附近找不到 reg" > "/dev/stderr"; exit 1 }
-                for (i = 1; i <= NR; i++) print lines[i]
-              }
-            ' dtb.orig.dts > "patched-$NAME.dts"
-            dtc -I dts -O dtb -o "dtb-$NAME.dtb" "patched-$NAME.dts"
+            # 按 ubi 分区起始地址 0x580000 定位那一行 reg 直接替换：
+            # 不用 awk 数组（CI 的 mawk 上未能生效），不用 \+（BSD sed 不认），也不依赖 label/reg 的先后顺序
+            sed -E "s/reg = <0x0*580000 0x[0-9a-fA-F]+>;/reg = <${OFF} ${SIZE}>;/" dtb.orig.dts > "patched-$NAME.dts"
+            grep -A3 'label = "ubi"' "patched-$NAME.dts"
+            if cmp -s dtb.orig.dts "patched-$NAME.dts"; then
+              echo "ERROR: 没替换到 ubi 的 reg（dts 里找不到 0x580000 起始的分区行）"
+              grep -A3 'label = "ubi"' dtb.orig.dts
+              exit 1
+            fi
+            dtc -q -I dts -O dtb -o "dtb-$NAME.dtb" "patched-$NAME.dts"
             echo "--- dtb-$NAME.dtb ---"
             dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"'
 
