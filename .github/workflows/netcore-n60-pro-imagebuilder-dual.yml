@@ -186,7 +186,6 @@ jobs:
             *) echo "ERROR: sing-box 二进制架构不对"; exit 1 ;;
           esac
           ls -lh pkgs/sing-box-bin
-
       - name: Build FILES overlay (easytier + luci + i18n)
         run: |
           git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
@@ -210,12 +209,18 @@ jobs:
           find files/etc -type f \( -name "*.sh" -o -path "files/etc/init.d/*" -o -path "files/etc/uci-defaults/*" \) -exec chmod 0755 {} +
           chmod 0755 files/usr/bin/*
 
-          # 中文翻译：用 luci 官方 po2lmo 编译（ImageBuilder 不带这个工具）
-          git clone --depth 1 https://github.com/immortalwrt/luci.git luci-src
-          gcc -O2 -o /tmp/po2lmo luci-src/modules/luci-base/src/po2lmo.c
+          # 中文翻译：po2lmo 必须走上游 Makefile（依赖 lib/lmo.c 与 lemon 生成的 plural_formula.c，
+          # 单独 gcc po2lmo.c 会报 undefined reference to sfh_hash）
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/immortalwrt/luci.git luci-src
+          git -C luci-src sparse-checkout set modules/luci-base/src
+          make -C luci-src/modules/luci-base/src po2lmo
+          [ -x luci-src/modules/luci-base/src/po2lmo ] || { echo "ERROR: po2lmo 构建失败"; exit 1; }
+
           mkdir -p files/usr/lib/lua/luci/i18n
-          /tmp/po2lmo et-src/luci-app-easytier/po/zh_Hans/easytier.po \
-                     files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo
+          luci-src/modules/luci-base/src/po2lmo \
+            et-src/luci-app-easytier/po/zh_Hans/easytier.po \
+            files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo
+          [ -s files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo ] || { echo "ERROR: easytier 中文 lmo 生成失败"; exit 1; }
           ls -l files/usr/lib/lua/luci/i18n/
 
           # 默认中文界面（用 printf 写，避免 heredoc 破坏 YAML 缩进）
