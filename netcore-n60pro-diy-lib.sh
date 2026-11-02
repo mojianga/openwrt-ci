@@ -3,9 +3,9 @@
 # Netcore N60 Pro (MT7986A) 硬改大分区固件 —— DIY 函数库（library，不是可执行脚本）
 #
 # 这里只有函数定义，本身不干活（直接执行会报错退出）。由下面两份 DIY 脚本 source：
-#   netcore-n60pro-immortal-506m.sh / netcore-n60pro-immortal-490m.sh
+#   netcore-n60-pro-immortal-506m.sh / netcore-n60-pro-immortal-490m.sh
 # GitHub Actions 里做二次改分区时也会 source 它：
-#   source "$(dirname "${BASH_SOURCE[0]}")/netcore-n60pro-diy-lib.sh"
+#   source "$(dirname "${BASH_SOURCE[0]}")/netcore-n60-pro-diy-lib.sh"
 # 注意与仓库里的 libwrt.sh / x86.sh 区别：那两个是可执行的 DIY 脚本，本文件是函数库。
 #
 # 约定：所有函数都假定当前工作目录是 OpenWrt 源码根目录（CI 里由 workflow
@@ -29,17 +29,12 @@ fi
 : "${GOLANG_REPO:=https://github.com/sbwml/packages_lang_golang.git}"
 : "${GOLANG_REF:=}"                      # 留空=默认分支；需要可复现时填 tag/commit
 
-: "${MEOW_REPO:=meow-rs/meow-rs}"
-: "${MEOW_VERSION:=latest}"              # latest=自动取最新；也可写 0.27.0 / v0.27.0
-: "${MEOW_MIRROR:=}"                     # 留空=GitHub 直连；国内可填 https://ghfast.top/
-: "${MEOW_ARCH:=aarch64_cortex-a53}"     # MT7986A = Cortex-A53
-: "${MEOW_REV_MAX:=9}"                   # 上游发布号 -rN 的探测上限
-
-: "${EASYTIER_REPO:=EasyTier/luci-app-easytier}"
-: "${EASYTIER_VERSION:=latest}"          # latest=自动取最新；也可写 2.6.4 / v2.6.4
-: "${EASYTIER_MIRROR:=}"                 # 同 MEOW_MIRROR
-: "${EASYTIER_ARCH:=aarch64_cortex-a53}" # 与 MEOW_ARCH 一致
-: "${EASYTIER_FLAVOR:=noweb}"            # noweb=不带内置 Web 控制台(~8MB)；web=带(~15MB)
+: "${MOMO_REPO:=nikkinikki-org/OpenWrt-momo}"
+: "${MOMO_VERSION:=latest}"              # latest=自动取最新；也可写 1.2.2 / v1.2.2
+: "${MOMO_ARCH:=aarch64_cortex-a53}"     # MT7986A = Cortex-A53
+: "${MOMO_BRANCH:=SNAPSHOT}"             # apk 版固件用 SNAPSHOT；opkg 版用 openwrt-24.10 / openwrt-25.12
+: "${MOMO_MIRROR:=}"                     # 留空=GitHub 直连；国内可填 https://ghfast.top/
+: "${MOMO_KEY_URL:=https://momomomo.pages.dev/public-key.pem}"  # 官方仓库公钥
 
 # ---- 日志 / 断言 -----------------------------------------------------------
 n60pro_log() { printf '\033[1;32m[n60pro]\033[0m %s\n' "$*"; }
@@ -100,9 +95,15 @@ n60pro_replace_singbox() {
   find . -type d -name sing-box -prune -exec rm -rf {} + 2>/dev/null || true
 
   n60pro_log "克隆 sing-box 源: $SINGBOX_REPO"
-  if ! git clone --depth=1 "$SINGBOX_REPO" "$tmp/src" >/dev/null 2>&1; then
-    rm -rf "$tmp"
-    n60pro_die "克隆 small-package 失败: $SINGBOX_REPO"
+  # small-package 仓库很大，先用部分克隆 + sparse-checkout 只取 sing-box 目录；不支持时退回完整克隆
+  if git clone --depth=1 --filter=blob:none --sparse "$SINGBOX_REPO" "$tmp/src" >/dev/null 2>&1 \
+     && git -C "$tmp/src" sparse-checkout set sing-box >/dev/null 2>&1 \
+     && [ -d "$tmp/src/sing-box" ]; then
+    n60pro_log "已用 sparse-checkout 只取 sing-box 目录"
+  else
+    rm -rf "$tmp/src"
+    git clone --depth=1 "$SINGBOX_REPO" "$tmp/src" >/dev/null 2>&1 \
+      || { rm -rf "$tmp"; n60pro_die "克隆 small-package 失败: $SINGBOX_REPO"; }
   fi
   if [ ! -d "$tmp/src/sing-box" ]; then
     rm -rf "$tmp"
@@ -132,7 +133,14 @@ n60pro_replace_golang() {
       || n60pro_die "克隆 golang feed 失败: $GOLANG_REPO"
   fi
 
-  [ -f "$dst/Makefile" ] || n60pro_die "golang feed 结构异常: $dst/Makefile 不存在"
+  # 上游仓库结构（sbwml/packages_lang_golang）：
+  #   根目录 = golang-package.mk / golang-values.mk 等公共 .mk + golang/ 子目录里的包 Makefile
+  # 所以整仓 clone 到 feeds/packages/lang/golang 后，包 Makefile 在 golang/Makefile，不在根目录
+  if [ ! -f "$dst/golang-package.mk" ] || [ ! -f "$dst/golang/Makefile" ]; then
+    n60pro_err "golang feed 结构异常，期望 $dst/golang-package.mk 与 $dst/golang/Makefile，实际内容："
+    ls -A "$dst" 2>/dev/null | sed 's/^/  /' >&2
+    n60pro_die "上游结构可能已变更，请检查 $GOLANG_REPO"
+  fi
   n60pro_log "golang 已替换，commit = $(git -C "$dst" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 }
 
@@ -163,274 +171,86 @@ n60pro_patch_ubi() {
   grep -n -A3 'label = "ubi"' "$dts" || true
 }
 
-# ---- 5) 内嵌 meow（预编译 apk -> files/ -> 首次启动安装）------------------
-# OpenWrt master 的 apk 是 apk-tools 3 的 ADB 容器，buildroot 阶段无法解包，
-# 所以只能把整包放进 rootfs，由 uci-defaults 在设备首次启动时安装。
-n60pro_embed_meow() {
-  local files_dir="$PWD/files"
-  local tag ver_num official fetch
+# ============================================================================
+# 下面是**可选函数**，默认不被任何 DIY 脚本调用：
+#   n60pro_embed_momo_repo   只内置 momo 本地 apk 仓库（不预装）
+# 需要时把函数加回 DIY 脚本即可（依赖见 configs/netcore-n60-pro-immortal.config）。
+# ============================================================================
 
-  # 1) 解析版本（latest 走 releases/latest 的 302，不消耗 API 额度）
-  tag=$(_n60pro_resolve_tag "$MEOW_REPO" "$MEOW_VERSION")
-  [ -n "$tag" ] || n60pro_die "解析 meow 版本失败: $MEOW_VERSION"
-  ver_num="${tag#v}"
-  n60pro_log "meow version -> ${tag}"
+# ---- 5) momo：只内置"本地 apk 仓库"，不预装 ------------------------------
+# momo 官方 release 的 momo_<arch>-<branch>.tar.gz 本身就是一个完整的 apk 仓库：
+#   packages.adb（apk-tools 3 索引）+ momo / luci-app-momo / luci-i18n-momo-zh-cn 三个 apk
+# 这里把它塞进固件 /usr/share/momo-apk/，并写一条本地仓库到 /etc/apk/repositories.d/，
+# 设备启动后在 LuCI「软件包」或命令行 apk add momo 即可安装，不需要联网、不受自编译 ABI 影响。
+# 依赖（kmod-*、sing-box 等）必须已经预装进固件，见 configs/netcore-n60-pro-immortal.config 的说明。
+n60pro_assert_momo_deps() {
+  local p missing=''
 
-  official="https://github.com/${MEOW_REPO}/releases/download/${tag}"
-  fetch="${MEOW_MIRROR}${official}"
-
-  # 2) 探测实际包名（上游的 -rN 发布号会变）
-  _n60pro_meow_pick_pkg() {
-    local name="$1" arch="$2" r f
-    for ((r = 1; r <= MEOW_REV_MAX; r++)); do
-      f="${name}_${ver_num}-r${r}_${arch}.apk"
-      if _n60pro_curl -I -o /dev/null --max-time 20 "${fetch}/${f}" 2>/dev/null; then
-        printf '%s' "$f"
-        return 0
-      fi
-    done
-    return 1
-  }
-
-  local core_pkg luci_pkg
-  core_pkg=$(_n60pro_meow_pick_pkg meow "$MEOW_ARCH") \
-    || n60pro_die "未找到 meow core 的 ${MEOW_ARCH} 包（${tag}）"
-  luci_pkg=$(_n60pro_meow_pick_pkg luci-app-meow all) \
-    || n60pro_die "未找到 luci-app-meow 包（${tag}）"
-  n60pro_log "core: ${core_pkg}"
-  n60pro_log "luci: ${luci_pkg}"
-
-  # 3) 下载：哈希只从 GitHub 官方取，二进制可以走镜像
-  local tmp; tmp=$(mktemp -d)
-  mkdir -p "$files_dir/usr/share/meow" "$files_dir/etc/uci-defaults"
-  _n60pro_curl -o "$tmp/core.apk.sha256" "${official}/${core_pkg}.sha256" || n60pro_die "下载 core sha256 失败"
-  _n60pro_curl -o "$tmp/luci.apk.sha256" "${official}/${luci_pkg}.sha256" || n60pro_die "下载 luci sha256 失败"
-  _n60pro_curl -o "$tmp/core.apk"        "${fetch}/${core_pkg}"          || n60pro_die "下载 meow core 失败"
-  _n60pro_curl -o "$tmp/luci.apk"        "${fetch}/${luci_pkg}"          || n60pro_die "下载 luci-app-meow 失败"
-
-  local n sum
-  for n in core luci; do
-    sum=$(grep -oE '[0-9a-fA-F]{64}' "$tmp/${n}.apk.sha256" | head -1 | tr 'A-F' 'a-f')
-    [ -n "$sum" ] || n60pro_die "${n} 的 sha256 文件解析失败"
-    printf '%s  %s\n' "$sum" "$tmp/${n}.apk" | sha256sum -c - >/dev/null \
-      || n60pro_die "${n} 校验失败"
+  [ -f "$PWD/.config" ] || { n60pro_log "跳过 momo 依赖检查（当前目录没有 .config）"; return 0; }
+  for p in ca-bundle curl firewall4 ip-full \
+           kmod-inet-diag kmod-nft-socket kmod-nft-tproxy kmod-tun kmod-dummy sing-box; do
+    grep -qE "^CONFIG_PACKAGE_${p}=y" "$PWD/.config" || missing="$missing $p"
   done
-  n60pro_log "sha256 校验通过"
-
-  cp -f "$tmp/core.apk" "$files_dir/usr/share/meow/meow.apk"
-  cp -f "$tmp/luci.apk" "$files_dir/usr/share/meow/luci-app-meow.apk"
-  rm -rf "$tmp"
-
-  cat > "$files_dir/etc/uci-defaults/99-install-meow" <<'EOS'
-#!/bin/sh
-# 首次启动安装内嵌的 meow 包（apk-tools 3 的 ADB 包，只能在设备上装）
-# 说明：纯本地 apk add，不联网、不 reboot，失败最坏结果就是多花几秒 + 下次启动重试
-APKDIR=/usr/share/meow
-LOG=/tmp/meow-install.log
-VER="__MEOW_VER__"
-CNT="/etc/meow-install.retry.$VER"
-MAX=3
-APK=$(command -v apk || echo /usr/bin/apk)
-
-[ -x "$APK" ] || exit 0
-[ -f "$APKDIR/meow.apk" ] || exit 0
-
-tries=0
-[ -f "$CNT" ] && tries=$(cat "$CNT" 2>/dev/null || echo 0)
-if [ "$tries" -ge "$MAX" ]; then
-  # 连续失败 MAX 次后放弃，避免每次启动都重试；apk 仍留在 $APKDIR 可手动安装
-  logger -t meow-install "give up after $MAX tries, install manually: apk add --allow-untrusted $APKDIR/*.apk"
-  exit 0
-fi
-
-echo "=== meow install start (try $((tries + 1))/$MAX) ===" > "$LOG"
-rc=0
-for p in meow luci-app-meow; do
-  f="$APKDIR/$p.apk"
-  [ -f "$f" ] || continue
-  out=$("$APK" add --upgrade --allow-untrusted "$f" 2>&1)
-  rc_pkg=$?
-  echo "$out" >> "$LOG"
-  if [ "$rc_pkg" -ne 0 ]; then
-    case "$out" in
-      *"already installed"*) ;;
-      *) echo "install $p FAILED" >> "$LOG"; rc=1 ;;
-    esac
+  if [ -n "$missing" ]; then
+    n60pro_err "momo 依赖没有编进固件:$missing"
+    n60pro_die "kmod 类依赖必须与内核同源，无法事后在线补装；请在 configs 里选中它们"
   fi
-done
-
-# 清 LuCI 缓存，让菜单立刻出现
-rm -rf /tmp/luci-* 2>/dev/null
-
-if [ "$rc" -ne 0 ]; then
-  # 返回非 0 时 uci-defaults 会保留本脚本，下次启动继续重试
-  echo $((tries + 1)) > "$CNT"
-  logger -t meow-install "install failed (try $((tries + 1))/$MAX), see $LOG"
-  exit 1
-fi
-
-rm -f /etc/meow-install.retry.*
-
-# apk add <文件> 会把 "包名><哈希" 写进 /etc/apk/world，等于把包钉死在这份 apk 上；
-# 换固件后哈希无解会让后续 apk 操作报错，这里改回纯包名。
-for p in meow luci-app-meow; do
-  if grep -q "^$p[><=~]" /etc/apk/world 2>/dev/null; then
-    sed -i "/^$p[><=~]/d" /etc/apk/world
-    echo "$p" >> /etc/apk/world
-  fi
-done
-
-logger -t meow-install "done, see $LOG"
-exit 0
-EOS
-  # 把版本号写进设备端脚本：计数文件按版本区分，换固件/换版本后自动重置重试次数
-  sed -i "s/__MEOW_VER__/${ver_num}/" "$files_dir/etc/uci-defaults/99-install-meow"
-  chmod +x "$files_dir/etc/uci-defaults/99-install-meow"
-
-  n60pro_log "meow 已内嵌：$(ls -1 "$files_dir/usr/share/meow/" | tr '\n' ' ')"
+  n60pro_log "momo 依赖齐全（curl / ip-full / firewall4 / ca-bundle / kmod-* / sing-box）"
 }
 
-# ---- 6) 内嵌 EasyTier（release zip -> 解压出 apk -> 首启安装）-------------
-# 上游发布形态：EasyTier-<tag>-<arch>-SNAPSHOT.zip（SNAPSHOT=apk 包，22.03.7=ipk 包）
-# 包内：easytier-<ver>.apk(带 Web 控制台) / easytier-noweb-<ver>.apk /
-#       luci-app-easytier-<ver>-r1.apk / luci-i18n-easytier-zh-cn-<ver>.apk
-# 上游没有提供 .sha256，这里用 unzip -t 完整性校验 + apk 魔数(ADBd) 双重检查
-n60pro_embed_easytier() {
+n60pro_embed_momo_repo() {
   local files_dir="$PWD/files"
-  local dstdir="$files_dir/usr/share/easytier"
-  local tag official fetch asset tmp core luci i18n
+  local repo_dir="$files_dir/usr/share/momo-apk"
+  local tag asset url tmp n
 
-  tag=$(_n60pro_resolve_tag "$EASYTIER_REPO" "$EASYTIER_VERSION")
-  [ -n "$tag" ] || n60pro_die "解析 easytier 版本失败: $EASYTIER_VERSION"
-  n60pro_log "easytier version -> ${tag}"
+  n60pro_assert_momo_deps
+  tag=$(_n60pro_resolve_tag "$MOMO_REPO" "$MOMO_VERSION")
+  [ -n "$tag" ] || n60pro_die "解析 momo 版本失败: $MOMO_VERSION"
+  asset="momo_${MOMO_ARCH}-${MOMO_BRANCH}.tar.gz"
+  url="${MOMO_MIRROR}https://github.com/${MOMO_REPO}/releases/download/${tag}/${asset}"
+  n60pro_log "momo repo -> ${tag}/${asset}"
 
-  official="https://github.com/${EASYTIER_REPO}/releases/download/${tag}"
-  fetch="${EASYTIER_MIRROR}${official}"
-  asset="EasyTier-${tag}-${EASYTIER_ARCH}-SNAPSHOT.zip"
-
-  # 1) 下载 zip 并校验完整性
   tmp=$(mktemp -d)
-  n60pro_log "下载 ${fetch}/${asset}"
-  if ! _n60pro_curl -o "$tmp/et.zip" "${fetch}/${asset}"; then
+  if ! _n60pro_curl -o "$tmp/momo.tar.gz" "$url"; then
     rm -rf "$tmp"
-    n60pro_die "下载 easytier 安装包失败: ${fetch}/${asset}"
+    n60pro_die "下载 momo 仓库失败: $url（检查 MOMO_ARCH=${MOMO_ARCH} / MOMO_BRANCH=${MOMO_BRANCH} 组合是否存在）"
   fi
-  if ! unzip -tq "$tmp/et.zip" >/dev/null; then
+
+  mkdir -p "$tmp/x"
+  tar -xzf "$tmp/momo.tar.gz" -C "$tmp/x" || { rm -rf "$tmp"; n60pro_die "解压 momo 仓库失败"; }
+
+  [ -f "$tmp/x/packages.adb" ] || { rm -rf "$tmp"; n60pro_die "momo 包里没有 packages.adb，不是 apk 仓库"; }
+  if [ -f "$tmp/x/index.json" ] && ! grep -q "$MOMO_ARCH" "$tmp/x/index.json"; then
+    n60pro_err "index.json 里的架构不是 $MOMO_ARCH："
+    head -5 "$tmp/x/index.json" >&2
     rm -rf "$tmp"
-    n60pro_die "easytier zip 完整性校验失败"
+    n60pro_die "下载到了错误架构的 momo 仓库"
   fi
-  unzip -oq "$tmp/et.zip" -d "$tmp/x" || { rm -rf "$tmp"; n60pro_die "解压 easytier zip 失败"; }
+  n=$(ls -1 "$tmp/x"/*.apk 2>/dev/null | wc -l | tr -d ' ')
+  [ "$n" -gt 0 ] || { rm -rf "$tmp"; n60pro_die "momo 仓库里没有 apk 包"; }
 
-  # 2) 从解压结果中挑包（文件名带版本号，用通配匹配）
-  _n60pro_et_pick() {
-    local f
-    f=$(find "$tmp/x" -maxdepth 1 -type f -name "$1" | sort | head -1)
-    [ -n "$f" ] || return 1
-    [ "$(head -c 4 "$f")" = "ADBd" ] || n60pro_die "不是 apk-tools 3 包: $f"
-    printf '%s' "$f"
-  }
-
-  case "$EASYTIER_FLAVOR" in
-    noweb) core=$(_n60pro_et_pick 'easytier-noweb-*.apk') || core='' ;;
-    web)   core=$(_n60pro_et_pick 'easytier-[0-9]*.apk') || core='' ;;
-    *)     rm -rf "$tmp"; n60pro_die "EASYTIER_FLAVOR 只能是 noweb 或 web: $EASYTIER_FLAVOR" ;;
-  esac
-  [ -n "$core" ] || { rm -rf "$tmp"; n60pro_die "zip 中未找到 easytier 核心包（${EASYTIER_FLAVOR}）"; }
-
-  luci=$(_n60pro_et_pick 'luci-app-easytier-*.apk') || luci=''
-  [ -n "$luci" ] || { rm -rf "$tmp"; n60pro_die "zip 中未找到 luci-app-easytier 包"; }
-  i18n=$(_n60pro_et_pick 'luci-i18n-easytier-zh-cn-*.apk') || i18n=''
-
-  n60pro_log "core: $(basename "$core")"
-  n60pro_log "luci: $(basename "$luci")"
-  if [ -n "$i18n" ]; then
-    n60pro_log "i18n: $(basename "$i18n")"
-  fi
-
-  # 3) 落到 files/，由 uci-defaults 在设备首次启动时 apk add
-  mkdir -p "$dstdir" "$files_dir/etc/uci-defaults"
-  cp -f "$core" "$dstdir/easytier.apk"
-  cp -f "$luci" "$dstdir/luci-app-easytier.apk"
-  if [ -n "$i18n" ]; then
-    cp -f "$i18n" "$dstdir/luci-i18n-easytier-zh-cn.apk"
-  else
-    rm -f "$dstdir/luci-i18n-easytier-zh-cn.apk"
-  fi
+  # 1) 仓库文件落到 rootfs（本地仓库，离线可用）
+  rm -rf "$repo_dir"
+  mkdir -p "$repo_dir" "$files_dir/etc/apk/keys" "$files_dir/etc/apk/repositories.d"
+  cp -f "$tmp/x"/*.apk "$repo_dir"/
+  cp -f "$tmp/x/packages.adb" "$repo_dir"/
+  [ -f "$tmp/x/index.json" ] && cp -f "$tmp/x/index.json" "$repo_dir"/
   rm -rf "$tmp"
 
-  cat > "$files_dir/etc/uci-defaults/99-install-easytier" <<'EOS'
-#!/bin/sh
-# 首次启动安装内嵌的 EasyTier（apk-tools 3 的 ADB 包，只能在设备上装）
-# 说明：纯本地 apk add，不联网、不 reboot，失败最坏结果就是多花几秒 + 下次启动重试
-APKDIR=/usr/share/easytier
-LOG=/tmp/easytier-install.log
-VER="__ET_VER__"
-CNT="/etc/easytier-install.retry.$VER"
-MAX=3
-APK=$(command -v apk || echo /usr/bin/apk)
-
-[ -x "$APK" ] || exit 0
-[ -f "$APKDIR/easytier.apk" ] || exit 0
-
-tries=0
-[ -f "$CNT" ] && tries=$(cat "$CNT" 2>/dev/null || echo 0)
-if [ "$tries" -ge "$MAX" ]; then
-  # 连续失败 MAX 次后放弃，避免每次启动都重试；apk 仍留在 $APKDIR 可手动安装
-  logger -t easytier-install "give up after $MAX tries, install manually: apk add --allow-untrusted $APKDIR/*.apk"
-  exit 0
-fi
-
-echo "=== easytier install start (try $((tries + 1))/$MAX) ===" > "$LOG"
-rc=0
-# 顺序：核心 -> LuCI -> 中文语言包
-for p in easytier luci-app-easytier luci-i18n-easytier-zh-cn; do
-  f="$APKDIR/$p.apk"
-  [ -f "$f" ] || continue
-  out=$("$APK" add --upgrade --allow-untrusted "$f" 2>&1)
-  rc_pkg=$?
-  echo "$out" >> "$LOG"
-  if [ "$rc_pkg" -ne 0 ]; then
-    case "$out" in
-      # 已安装同版本时 apk 会报这个，不算失败
-      *"already installed"*) ;;
-      *) echo "install $p FAILED" >> "$LOG"; rc=1 ;;
-    esac
+  # 2) 上游签名公钥（官方 feed 用的是 /etc/apk/keys/momo.pem 这个文件名）
+  if ! _n60pro_curl -o "$files_dir/etc/apk/keys/momo.pem" "${MOMO_KEY_URL}"; then
+    n60pro_die "下载 momo 公钥失败: ${MOMO_KEY_URL}"
   fi
-done
+  grep -q "BEGIN PUBLIC KEY" "$files_dir/etc/apk/keys/momo.pem" \
+    || n60pro_die "momo 公钥格式异常（不是 PEM 公钥）"
 
-# 清 LuCI 缓存，让菜单立刻出现
-rm -rf /tmp/luci-* 2>/dev/null
-
-if [ "$rc" -ne 0 ]; then
-  # 返回非 0 时 uci-defaults 会保留本脚本，下次启动继续重试
-  echo $((tries + 1)) > "$CNT"
-  logger -t easytier-install "install failed (try $((tries + 1))/$MAX), see $LOG"
-  exit 1
-fi
-
-rm -f /etc/easytier-install.retry.*
-
-# apk add <文件> 会把 "包名><哈希" 写进 /etc/apk/world，等于把包钉死在这份 apk 上；
-# 换固件后哈希无解会让后续 apk 操作报错，这里改回纯包名。
-for p in easytier luci-app-easytier luci-i18n-easytier-zh-cn; do
-  if grep -q "^$p[><=~]" /etc/apk/world 2>/dev/null; then
-    sed -i "/^$p[><=~]/d" /etc/apk/world
-    echo "$p" >> /etc/apk/world
-  fi
-done
-
-logger -t easytier-install "done, see $LOG"
-exit 0
+  # 3) 本地仓库声明：索引名以 .adb 结尾，apk 会按 ndx(v3) 解析
+  cat > "$files_dir/etc/apk/repositories.d/momo.list" <<'EOS'
+# momo 本地 apk 仓库（随固件内置，离线可用）
+# 安装：apk add momo luci-app-momo luci-i18n-momo-zh-cn
+# 若提示 UNTRUSTED signature，可临时用 apk --allow-untrusted add momo
+/usr/share/momo-apk/packages.adb
 EOS
-  # 把版本号写进设备端脚本：计数文件按版本区分，换固件/换版本后自动重置重试次数
-  sed -i "s/__ET_VER__/${tag#v}/" "$files_dir/etc/uci-defaults/99-install-easytier"
-  chmod +x "$files_dir/etc/uci-defaults/99-install-easytier"
 
-  # config 里若已从 feed 编译了同名包，这里是“覆盖安装”，会造成镜像内重复打包
-  if grep -qs '^CONFIG_PACKAGE_easytier=y' "$PWD/.config"; then
-    n60pro_log "提示: .config 已启用 CONFIG_PACKAGE_easytier（源码编译），内嵌 apk 会在首启覆盖同名包；"
-    n60pro_log "      如果只想保留预编译版，请从 configs 里删掉 CONFIG_PACKAGE_easytier / luci-app-easytier / luci-i18n-easytier-zh-cn"
-  fi
-
-  n60pro_log "easytier 已内嵌：$(ls -1 "$dstdir" | tr '\n' ' ')"
+  n60pro_log "momo 仓库已内置：$n 个包，$(du -sk "$repo_dir" | awk '{print $1}') KB"
 }
