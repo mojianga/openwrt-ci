@@ -1,4 +1,4 @@
-name: n60-pro-imagebuilder-dual
+name: netcore-n60pro-imagebuilder-dual
 
 # 思路：
 #   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
@@ -67,7 +67,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get -y update
-          sudo -E apt-get -y install zstd unzip device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev
+          sudo -E apt-get -y install zstd unzip jq device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev
 
       - name: Download ImageBuilder
         run: |
@@ -88,7 +88,9 @@ jobs:
           elif [ -f repositories.conf ]; then
             REPO_FILE=repositories.conf
           else
-            echo "ERROR: 找不到 repositories / repositories.conf"; ls -a; exit 1
+            echo "ERROR: 找不到 repositories / repositories.conf"
+            ls -a
+            exit 1
           fi
           case "$REPO_FILE" in
             repositories)      echo "$MOMO_REPO" >> "$REPO_FILE" ;;
@@ -97,8 +99,10 @@ jobs:
           mkdir -p keys
           curl -fsSL --retry 3 https://momomomo.pages.dev/public-key.pem -o keys/momo.pem
           echo "REPO_FILE=$REPO_FILE" >> $GITHUB_ENV
-          echo "--- $REPO_FILE ---"; cat "$REPO_FILE"
-          echo "--- keys ---"; ls -l keys
+          echo "--- $REPO_FILE ---"
+          cat "$REPO_FILE"
+          echo "--- keys ---"
+          ls -l keys
 
       - name: Fetch EasyTier binaries
         env:
@@ -109,10 +113,12 @@ jobs:
           if [ -z "$TAG" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                    https://api.github.com/repos/EasyTier/EasyTier/releases/latest \
-                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+                 | jq -r '.tag_name')
           fi
+          [ -n "$TAG" ] || { echo "ERROR: 取 EasyTier 版本失败"; exit 1; }
           echo "EasyTier tag = $TAG"
           URL="https://github.com/EasyTier/EasyTier/releases/download/${TAG}/easytier-linux-aarch64-${TAG}.zip"
+          echo "URL=$URL"
           curl -fL --retry 3 -o pkgs/easytier.zip "$URL"
           unzip -o -j pkgs/easytier.zip -d pkgs/et
           ls -l pkgs/et
@@ -127,29 +133,18 @@ jobs:
           if [ -z "$TAG" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                    https://api.github.com/repos/meow-rs/meow-rs/releases/latest \
-                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+                 | jq -r '.tag_name')
           fi
+          [ -n "$TAG" ] || { echo "ERROR: 取 meow 版本失败"; exit 1; }
           echo "meow tag = $TAG"
           curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/meow-rs/meow-rs/releases/tags/${TAG}" > /tmp/meow.json
-          MEOW_URL=$(python3 - <<PY
-import json
-d = json.load(open('/tmp/meow.json'))
-a = [x['browser_download_url'] for x in d['assets']
-     if x['name'].startswith('meow_') and x['name'].endswith('_${PKG_ARCH}.apk')]
-print(a[0] if a else '')
-PY
-)
-          LUCI_URL=$(python3 - <<PY
-import json
-d = json.load(open('/tmp/meow.json'))
-a = [x['browser_download_url'] for x in d['assets']
-     if x['name'].startswith('luci-app-meow_') and x['name'].endswith('_all.apk')]
-print(a[0] if a else '')
-PY
-)
-          [ -n "$MEOW_URL" ] || { echo "ERROR: 没找到 meow 的 ${PKG_ARCH} apk"; exit 1; }
-          [ -n "$LUCI_URL" ] || { echo "ERROR: 没找到 luci-app-meow apk"; exit 1; }
+          MEOW_URL=$(jq -r '.assets[].browser_download_url' /tmp/meow.json \
+                     | grep -E "/meow_[^/]*_${PKG_ARCH}\.apk\$" | head -1)
+          LUCI_URL=$(jq -r '.assets[].browser_download_url' /tmp/meow.json \
+                     | grep -E "/luci-app-meow_[^/]*_all\.apk\$" | head -1)
+          [ -n "$MEOW_URL" ] || { echo "ERROR: 没找到 meow 的 ${PKG_ARCH} apk"; jq -r '.assets[].name' /tmp/meow.json; exit 1; }
+          [ -n "$LUCI_URL" ] || { echo "ERROR: 没找到 luci-app-meow apk"; jq -r '.assets[].name' /tmp/meow.json; exit 1; }
           echo "meow: $MEOW_URL"
           echo "luci: $LUCI_URL"
           curl -fL --retry 3 -o pkgs/meow.apk "$MEOW_URL"
@@ -165,18 +160,17 @@ PY
           if [ -z "$TAG" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                    https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-                 | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')
+                 | jq -r '.tag_name')
           fi
+          [ -n "$TAG" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
           VER=${TAG#v}
           echo "sing-box tag = $TAG"
-          # 守卫：momo 要求 sing-box >= 1.12
-          python3 - "$VER" <<'PY'
-import sys
-v = sys.argv[1].split('-')[0]
-major, minor = map(int, v.split('.')[:2])
-assert (major, minor) >= (1, 12), f'sing-box {v} < 1.12，momo 不兼容'
-print(f'sing-box version check OK: {v}')
-PY
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          if ! { [ "$MAJOR" -ge 1 ] && [ "$MINOR" -ge 12 ]; }; then
+            echo "ERROR: sing-box $VER < 1.12，momo 不兼容"
+            exit 1
+          fi
           URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64.tar.gz"
           echo "URL=$URL"
           curl -fL --retry 3 -o pkgs/sing-box.tar.gz "$URL"
@@ -224,14 +218,10 @@ PY
                      files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo
           ls -l files/usr/lib/lua/luci/i18n/
 
-          # 默认中文界面
+          # 默认中文界面（用 printf 写，避免 heredoc 破坏 YAML 缩进）
           mkdir -p files/etc/uci-defaults
-          cat > files/etc/uci-defaults/99-n60pro-lang <<'EOS'
-#!/bin/sh
-uci -q set luci.main.lang='zh_cn'
-uci -q commit luci
-exit 0
-EOS
+          printf '%s\n' '#!/bin/sh' "uci -q set luci.main.lang='zh_cn'" 'uci -q commit luci' 'exit 0' \
+            > files/etc/uci-defaults/99-n60pro-lang
           chmod 0755 files/etc/uci-defaults/99-n60pro-lang
 
           echo "===== FILES 预览 ====="
@@ -273,7 +263,6 @@ EOS
           RFS_POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Filesystem/{print pos; exit}' fit-base.txt)
           echo "positions: kernel=$KER_POS fdt=$FDT_POS rootfs=$RFS_POS"
           [ -n "$KER_POS" ] && [ -n "$FDT_POS" ] && [ -n "$RFS_POS" ] || { echo "ERROR: FIT 结构解析失败"; cat fit-base.txt; exit 1; }
-
           dumpimage -T kernel     -p "$KER_POS" -o kernel.gz  base.itb
           dumpimage -T flat_dt    -p "$FDT_POS" -o orig.dtb   base.itb
           dumpimage -T filesystem -p "$RFS_POS" -o rootfs.bin base.itb
@@ -281,72 +270,69 @@ EOS
           dtc -I dtb -O dts orig.dtb -o orig.dts
           grep -A3 'label = "ubi"' orig.dts
 
+      - name: Patch dtb for two partitions
+        run: |
+          for PAIR in "506m 0x0580000 0x1fa80000" "490m 0x0580000 0x1ea00000"; do
+            set -- $PAIR
+            NAME="$1"
+            OFF="$2"
+            SIZE="$3"
+            awk -v off="$OFF" -v size="$SIZE" '
+              /label = "ubi";/ { hit = 1 }
+              hit && /reg = </ {
+                sub(/reg = <0x[0-9a-fA-F]+ 0x[0-9a-fA-F]+>/, "reg = <" off " " size ">")
+                hit = 0
+              }
+              { print }
+            ' orig.dts > "patched-$NAME.dts"
+            grep -A3 'label = "ubi"' "patched-$NAME.dts"
+            dtc -I dts -O dtb -o "dtb-$NAME.dtb" "patched-$NAME.dts"
+            echo "--- dtb-$NAME.dtb ---"
+            dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"'
+          done
+
       - name: Repack two itb with patched dtb
         run: |
-          python3 - <<'PY'
-import re
-src = open('orig.dts').read()
-pat = re.compile(r'(label = "ubi";\s*reg = <)(0x[0-9a-fA-F]+)( )(0x[0-9a-fA-F]+)(>;)')
-m = pat.search(src)
-assert m, '未在 dts 中找到 ubi 分区 reg'
-print('原始 ubi reg: <%s %s>' % (m.group(2), m.group(4)))
-for name, off, size in (('506m', '0x0580000', '0x1fa80000'), ('490m', '0x0580000', '0x1ea00000')):
-    out = src[:m.start()] + m.group(1) + off + m.group(3) + size + m.group(5) + src[m.end():]
-    open('patched-%s.dts' % name, 'w').write(out)
-    print('生成 patched-%s.dts: <%s %s>' % (name, off, size))
-PY
-
           for S in 506m 490m; do
-            dtc -I dts -O dtb -o dtb-$S.dtb patched-$S.dts
-            echo "--- dtb-$S.dtb ---"
-            dtc -I dtb -O dts dtb-$S.dtb | grep -A3 'label = "ubi"'
-
             # 与官方完全一致的打包方式：mkits.sh + mkimage -E -B 0x1000 -p 0x1000
             "$IB_DIR"/scripts/mkits.sh \
               -D "$DEVICE_NAME" \
-              -o fit-$S.its \
+              -o "fit-$S.its" \
               -k kernel.gz \
               -C gzip \
-              -d dtb-$S.dtb \
+              -d "dtb-$S.dtb" \
               -r rootfs.bin \
               -a "$KERNEL_LOADADDR" -e "$KERNEL_LOADADDR" \
               -A arm64 -c config-1 -H sha256 \
               -v "6.6"
-            mkimage -E -B 0x1000 -p 0x1000 -f fit-$S.its itb-$S.itb
+            mkimage -E -B 0x1000 -p 0x1000 -f "fit-$S.its" "itb-$S.itb"
           done
 
-          # 回填原 itb 尾部的 metadata（内容只含设备名与版本，与分区无关）
-          python3 - <<'PY'
-src = open('base.itb', 'rb').read()
-i = src.find(b'{"metadata_version"')
-assert i > 0, '未在 base.itb 中找到 metadata JSON'
-meta = src[i:]
-print('metadata:', meta[:160])
-for s in ('506m', '490m'):
-    open('itb-%s.itb' % s, 'ab').write(meta)
-    print('itb-%s.itb += %d bytes' % (s, len(meta)))
-PY
+          # 回填原 itb 尾部的 metadata（只含设备名与版本，与分区无关）
+          OFFSET=$(grep -abo '{"metadata_version"' base.itb | head -1 | cut -d: -f1)
+          echo "metadata offset = $OFFSET"
+          [ -n "$OFFSET" ] || { echo "ERROR: base.itb 里没有 metadata"; exit 1; }
+          for S in 506m 490m; do
+            tail -c +"$((OFFSET + 1))" base.itb >> "itb-$S.itb"
+          done
           ls -lh itb-506m.itb itb-490m.itb
 
       - name: Verify itb
         run: |
-          set -e
           for S in 506m 490m; do
             echo "======== itb-$S.itb ========"
-            dumpimage -l itb-$S.itb | tee fit-$S.txt
-            grep -q "Flat Device Tree" fit-$S.txt || { echo "ERROR: 缺少 dtb"; exit 1; }
-            grep -q "Filesystem"      fit-$S.txt || { echo "ERROR: 缺少 rootfs"; exit 1; }
-
-            POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' fit-$S.txt)
-            dumpimage -T flat_dt -p "$POS" -o check-$S.dtb itb-$S.itb
-            REG=$(dtc -I dtb -O dts check-$S.dtb | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
+            dumpimage -l "itb-$S.itb" | tee "fit-$S.txt"
+            grep -q "Flat Device Tree" "fit-$S.txt" || { echo "ERROR: 缺少 dtb"; exit 1; }
+            grep -q "Filesystem" "fit-$S.txt" || { echo "ERROR: 缺少 rootfs"; exit 1; }
+            POS=$(awk '/Image [0-9]+ \(/{pos=$2} /Type: *Flat Device Tree/{print pos; exit}' "fit-$S.txt")
+            dumpimage -T flat_dt -p "$POS" -o "check-$S.dtb" "itb-$S.itb"
+            REG=$(dtc -I dtb -O dts "check-$S.dtb" | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
             echo "ubi reg = <$REG>"
             case "$S" in
-              506m) [ "$REG" = "$UBI_506M" ] || { echo "ERROR: 506M 分区不对"; exit 1; } ;;
-              490m) [ "$REG" = "$UBI_490M" ] || { echo "ERROR: 490M 分区不对"; exit 1; } ;;
+              506m) [ "$REG" = "$UBI_506M" ] || { echo "ERROR: 506M 分区不对，期望 <$UBI_506M>"; exit 1; } ;;
+              490m) [ "$REG" = "$UBI_490M" ] || { echo "ERROR: 490M 分区不对，期望 <$UBI_490M>"; exit 1; } ;;
             esac
           done
-
           H506=$(sha256sum itb-506m.itb | cut -d' ' -f1)
           H490=$(sha256sum itb-490m.itb | cut -d' ' -f1)
           [ "$H506" != "$H490" ] || { echo "ERROR: 两个 itb 完全相同"; exit 1; }
