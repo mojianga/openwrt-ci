@@ -1,14 +1,20 @@
-name: netcore-n60pro-immortal-dual
+name: netcore-n60-pro-immortal-dual
 
 # 单 job 出两种分区固件：
-#   1) 用 netcore-n60pro-immortal-506m.sh 做 DIY，完整编译产出 506.5MB 固件
+#   1) 用 netcore-n60-pro-immortal-506m.sh 做 DIY，完整编译产出 506.5MB 固件
 #   2) 复用已编译的工具链 / 软件包，只把 DTS 的 ubi 改成 490MB，重建 dtb/kernel/镜像
 #
 # 文件分工（避免混淆）：
-#   DIY_SCRIPT = netcore-n60pro-immortal-506m.sh   可执行，本 workflow 唯一会跑的 DIY 脚本
-#   DIY_LIB    = netcore-n60pro-diy-lib.sh        函数库，只被 source（换 golang/装 meow/装 easytier/改 DTS）
-#   netcore-n60pro-immortal-490m.sh               可执行，仅供单独构建 490MB 时用，本 workflow 不执行它
-# 前置要求：configs/netcore-n60pro-immortal.config 里不能有 CONFIG_IB / CONFIG_SDK
+#   DIY_SCRIPT = netcore-n60-pro-immortal-506m.sh   可执行，本 workflow 唯一会跑的 DIY 脚本
+#   DIY_LIB    = netcore-n60-pro-diy-lib.sh         函数库，只被 source（改 IP / 改 DTS；内嵌工具函数为可选）
+#   netcore-n60-pro-immortal-490m.sh                可执行，仅供本地单独构建 490MB 用，本 workflow 不执行它
+#
+# 固件内容：不预装 momo / meow / easytier / sing-box 等代理工具，
+# 只在 configs 里预置它们运行所需的 kmod 与用户态工具（见 configs 末尾的依赖清单）。
+#
+# 变体一致性：两个 Release 是分开的两次上传，中途被取消会出现 506m 新 / 490m 旧。
+# 因此上传前会校验两个镜像内容必须不同（见 Verify Variants Differ），并在结束时校验两目录非空。
+# 前置要求：configs/netcore-n60-pro-immortal.config 里不能有 CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK
 
 on:
   workflow_dispatch:
@@ -25,13 +31,19 @@ permissions:
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
   REPO_BRANCH: master
-  CONFIG_FILE: configs/netcore-n60pro-immortal.config
-  DIY_SCRIPT: netcore-n60pro-immortal-506m.sh
-  DIY_LIB: netcore-n60pro-diy-lib.sh
+  CONFIG_FILE: configs/netcore-n60-pro-immortal.config
+  DIY_SCRIPT: netcore-n60-pro-immortal-506m.sh
+  DIY_LIB: netcore-n60-pro-diy-lib.sh
   CACHE_TOOLCHAIN: 'true'
   TZ: Asia/Shanghai
   DTS_PATH: target/linux/mediatek/dts/mt7986a-netcore-n60-pro.dts
   DTB_NAME: image-mt7986a-netcore-n60-pro.dtb
+  KERNEL_BIN: netcore_n60-pro-kernel.bin
+  DEVICE_GLOB: '*n60-pro*'
+  DEVICE_SYMBOL: CONFIG_TARGET_mediatek_filogic_DEVICE_netcore_n60-pro
+  # defconfig 之后必须仍然存在的关键包（丢了说明 feeds/DIY 出错）：
+  # sing-box 本体 + 代理工具所需依赖
+  MUST_KEEP_PACKAGES: CONFIG_PACKAGE_sing-box CONFIG_PACKAGE_kmod-tun CONFIG_PACKAGE_kmod-nft-tproxy
   UBI_506M: 0x0580000 0x1fa80000
   UBI_490M: 0x0580000 0x1ea00000
   TAG_506M: netcore-n60pro-immortal-506m
@@ -41,7 +53,11 @@ jobs:
   build:
     name: Build N60 Pro (506M + 490M)
     runs-on: ubuntu-24.04
-    if: vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
+    # workflow_dispatch 随时可跑；watch（star 触发）必须显式配置 STAR_ACTOR，
+    # 否则任何人点星都会触发两遍完整编译（约数小时）
+    if: github.event_name == 'workflow_dispatch' || (vars.STAR_ACTOR != '' && github.actor == vars.STAR_ACTOR)
+    # 两遍编译（第二遍含增量重编）逼近 6h 默认上限，显式超时比被系统 kill 更好排查
+    timeout-minutes: 350
 
     steps:
       - name: Initialization Environment
@@ -86,9 +102,8 @@ jobs:
       - name: Clone package
         run: |
           cd openwrt
-          # easytier 不再走 feed 源码编译，改为内嵌官方预编译 apk（见 netcore-n60pro-diy-lib.sh）
+          # 只加明确定义的第三方 feed；momo / easytier 不再从 feed 源码编译（固件不预装它们）
           sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
-          sed -i '1i src-git momo https://github.com/nikkinikki-org/OpenWrt-momo.git;main' feeds.conf.default
 
       - name: Generate Variables
         run: |
@@ -100,15 +115,17 @@ jobs:
           echo "DEVICE_TARGET=$(grep '^CONFIG_TARGET_BOARD' .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
           echo "DEVICE_SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET' .config | awk -F '"' '{print $2}')" >> $GITHUB_ENV
 
-          # 守卫 1：CONFIG_IB=y 会让 subtarget 下所有设备内核都参与构建（会把 keenetic_kn-1012 拉进来并因缺 u-boot.bin 失败）
-          if grep -q '^CONFIG_IB=y' .config; then
-            echo "ERROR: .config 中 CONFIG_IB=y，请从 $CONFIG_FILE 中删除 CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK"
+          # 守卫 1：CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK 任一为 y 都会让 subtarget 下
+          # 所有设备的内核参与构建（会把 keenetic_kn-1012 拉进来并因缺 u-boot.bin 失败）
+          if grep -qE '^CONFIG_(IB|IB_STANDALONE|SDK)=y' .config; then
+            grep -E '^CONFIG_(IB|IB_STANDALONE|SDK)=y' .config
+            echo "ERROR: .config 中开启了 CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK，请从 $CONFIG_FILE 中删除"
             exit 1
           fi
           # 守卫 2：必须且只能是 netcore_n60-pro 一个设备
           echo "selected device count = $(grep -c '^CONFIG_TARGET_[a-z0-9_]*_DEVICE_.*=y$' .config || true)"
-          if ! grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_netcore_n60-pro=y' .config; then
-            echo "ERROR: 未选中 netcore_n60-pro"
+          if ! grep -q "^${DEVICE_SYMBOL}=y" .config; then
+            echo "ERROR: 未选中目标设备（$DEVICE_SYMBOL）"
             exit 1
           fi
           grep '^CONFIG_TARGET_.*_DEVICE_.*=y$' .config
@@ -146,7 +163,22 @@ jobs:
       - name: Download DL Package
         run: |
           cd $OPENWRT_PATH
+          # DIY 换掉了 golang / sing-box，make defconfig 可能悄悄丢弃已选项：
+          # 先存一份快照做 diff（丢弃的符号打 WARNING），再对关键插件做硬校验
+          cp .config /tmp/config.pre-defconfig
           make defconfig
+          comm -23 \
+            <(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y' /tmp/config.pre-defconfig | sort -u) \
+            <(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y' .config | sort -u) > /tmp/config.lost || true
+          if [ -s /tmp/config.lost ]; then
+            echo "WARNING: make defconfig 丢弃了以下已选项（换源后符号变化属正常，但需确认）："
+            cat /tmp/config.lost
+          fi
+          # 关键插件必须还在，否则说明 feeds 安装或 DIY 出了问题
+          for sym in $MUST_KEEP_PACKAGES; do
+            grep -q "^${sym}=y" .config || { echo "ERROR: defconfig 后 ${sym} 丢失，请检查 feeds/DIY"; exit 1; }
+          done
+
           make download -j8 || make download -j1 V=s
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
@@ -163,11 +195,12 @@ jobs:
           EXPECT_UBI: 0x1fa80000
         run: |
           cd $OPENWRT_PATH
-          DTB=$(find build_dir -name "$DTB_NAME" | head -1)
+          DTB=$(find build_dir -name "$DTB_NAME" 2>/dev/null | head -1) || true
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
           dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
           dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
           echo "OK: ubi = $EXPECT_UBI"
+          echo "DTB_SHA_506M=$(sha256sum "$DTB" | cut -d' ' -f1)" >> $GITHUB_ENV
 
       - name: Collect Firmware (506M)
         env:
@@ -178,7 +211,7 @@ jobs:
           rm -rf "$OUT"; mkdir -p "$OUT"
           shopt -s nullglob
           n=0
-          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
+          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/$DEVICE_GLOB; do
             base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
             cp -f "$f" "$OUT/${stem}-${SIZE}.${ext}"
             n=$((n + 1))
@@ -192,15 +225,26 @@ jobs:
       - name: Rebuild Firmware (490M)
         run: |
           cd $OPENWRT_PATH
-          # 复用 DIY 公共库的分区替换逻辑（幂等：已是目标分区则跳过）
+          # 复用 DIY 函数库的分区替换逻辑（幂等：已是目标分区则跳过）
           source "$GITHUB_WORKSPACE/$DIY_LIB"
           n60pro_patch_ubi "$UBI_490M" "$UBI_506M" "$DTS_PATH"
           echo "==================== DTS 已切换为 490M ===================="
 
-          # 只删掉与 dtb / 设备 kernel 相关的产物，强制重新生成（vmlinux、软件包全部复用）
-          find build_dir -type f -name "image-mt7986a-netcore*n60-pro.dtb" -delete
-          find build_dir -type f -name 'netcore_n60-pro-kernel.bin' -delete
-          find build_dir -type f -path '*arch/arm64/boot/dts/mediatek/mt7986a-netcore-n60-pro.dtb' -delete
+          # 只删与 dtb / 设备 kernel 相关的产物，强制重新生成（vmlinux、软件包全部复用）。
+          # 用 -print 计数：find -delete 没匹配到也返回 0，一旦文件名漂移就会静默留下旧产物，
+          # 导致后面把一个改名的 506M 镜像当 490M 发出去，所以这里必须硬断言。
+          [ -d build_dir ] || { echo "ERROR: build_dir 不存在，第一遍编译没有产物"; exit 1; }
+          removed=$(find build_dir -type f \
+            \( -name "image-*n60-pro.dtb" \
+               -o -name "$KERNEL_BIN" \
+               -o -path "*/mediatek/$(basename "$DTS_PATH")" \) \
+            -print -delete | wc -l | tr -d ' ')
+          echo "已删除过期产物: $removed 个"
+          [ "$removed" -ge 2 ] || {
+            echo "ERROR: 过期产物没删到（期望 dtb + kernel.bin），文件名可能已变更，拒绝发布未重编的镜像"
+            find build_dir -name "*n60-pro*" | head -20
+            exit 1
+          }
 
           make -j$(nproc) || make -j1 || make -j1 V=s
 
@@ -209,11 +253,17 @@ jobs:
           EXPECT_UBI: 0x1ea00000
         run: |
           cd $OPENWRT_PATH
-          DTB=$(find build_dir -name "$DTB_NAME" | head -1)
+          DTB=$(find build_dir -name "$DTB_NAME" 2>/dev/null | head -1) || true
           [ -n "$DTB" ] || { echo "ERROR: 未找到编译产出的 dtb"; exit 1; }
           dtc -I dtb -O dts "$DTB" | grep -A3 'label = "ubi"'
           dtc -I dtb -O dts "$DTB" | grep -qiF "$EXPECT_UBI" || { echo "ERROR: ubi 分区不是 $EXPECT_UBI"; exit 1; }
           echo "OK: ubi = $EXPECT_UBI"
+          # 与第一遍的 dtb 指纹对比，确保 dtb 真的重新生成了
+          DTB_SHA_490M=$(sha256sum "$DTB" | cut -d' ' -f1)
+          echo "dtb 506M: ${DTB_SHA_506M:-unknown}"
+          echo "dtb 490M: ${DTB_SHA_490M}"
+          [ "$DTB_SHA_490M" != "${DTB_SHA_506M:-}" ] \
+            || { echo "ERROR: dtb 与第一遍完全相同，第二次 make 没有重新生成 dtb"; exit 1; }
 
       - name: Collect Firmware (490M)
         env:
@@ -224,7 +274,7 @@ jobs:
           rm -rf "$OUT"; mkdir -p "$OUT"
           shopt -s nullglob
           n=0
-          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/*n60-pro*; do
+          for f in bin/targets/$DEVICE_TARGET/$DEVICE_SUBTARGET/$DEVICE_GLOB; do
             base=$(basename "$f"); stem="${base%.*}"; ext="${base##*.}"
             cp -f "$f" "$OUT/${stem}-${SIZE}.${ext}"
             n=$((n + 1))
@@ -234,6 +284,20 @@ jobs:
           ( cd "$OUT" && sha256sum * > "sha256sums-${SIZE}.txt" )
           ls -l "$OUT"
 
+      # 上传前最后一道关：两个变体的最终镜像必须真的不同
+      - name: Verify Variants Differ
+        run: |
+          IMG506=$(ls $GITHUB_WORKSPACE/fw/506m/*sysupgrade*.bin 2>/dev/null | head -1) || true
+          IMG490=$(ls $GITHUB_WORKSPACE/fw/490m/*sysupgrade*.bin 2>/dev/null | head -1) || true
+          [ -n "$IMG506" ] && [ -n "$IMG490" ] || { echo "ERROR: fw 目录里没找到 sysupgrade 镜像"; exit 1; }
+          H506=$(sha256sum "$IMG506" | cut -d' ' -f1)
+          H490=$(sha256sum "$IMG490" | cut -d' ' -f1)
+          echo "506M: $(basename "$IMG506") ($(stat -c %s "$IMG506") bytes) $H506"
+          echo "490M: $(basename "$IMG490") ($(stat -c %s "$IMG490") bytes) $H490"
+          # 分区不同 → 内容必然不同；相同说明第二遍没生效，发出去就是个改了名的 506M
+          [ "$H506" != "$H490" ] \
+            || { echo "ERROR: 490M 与 506M 镜像内容完全相同，第二次编译没有产出新镜像"; exit 1; }
+
       - name: Upload Firmware To Release (506M)
         uses: ncipollo/release-action@v1
         with:
@@ -241,7 +305,7 @@ jobs:
           name: ImmortalWrt N60 Pro 506.5MB
           body: |
             Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
-            分区布局：spi-nand-512MB-ubi-506.5MB（ubi 0x0580000 + 0x1fa80000）
+            分区布局：spi-nand-512MB-ubi-506.5MB（ubi ${{ env.UBI_506M }}）
 
             默认地址：192.168.12.1  默认用户：root  默认密码：password
             源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
@@ -257,7 +321,7 @@ jobs:
           name: ImmortalWrt N60 Pro 490MB
           body: |
             Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
-            分区布局：spi-nand-512MB-ubi-490MB（ubi 0x0580000 + 0x1ea00000）
+            分区布局：spi-nand-512MB-ubi-490MB（ubi ${{ env.UBI_490M }}）
 
             默认地址：192.168.12.1  默认用户：root  默认密码：password
             源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
