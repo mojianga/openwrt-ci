@@ -9,8 +9,12 @@ name: netcore-n60-pro-immortal-dual
 #   DIY_LIB    = netcore-n60-pro-diy-lib.sh         函数库，只被 source（改 IP / 改 DTS；内嵌工具函数为可选）
 #   netcore-n60-pro-immortal-490m.sh                可执行，仅供本地单独构建 490MB 用，本 workflow 不执行它
 #
-# 固件内容：不预装 momo / meow / easytier / sing-box 等代理工具，
+# 固件内容：预装 momo + easytier 本体及其中文 LuCI，其余代理工具（meow / nikki 等）不预装，
 # 只在 configs 里预置它们运行所需的 kmod 与用户态工具（见 configs 末尾的依赖清单）。
+#
+# 第三方包源（不走 feed，直接整仓 clone 到 package/ 下，见 Clone package 步骤）：
+#   package/easytier <- https://github.com/EasyTier/luci-app-easytier
+#   package/momo     <- https://github.com/nikkinikki-org/OpenWrt-momo
 #
 # 变体一致性：两个 Release 是分开的两次上传，中途被取消会出现 506m 新 / 490m 旧。
 # 因此上传前会校验两个镜像内容必须不同（见 Verify Variants Differ），并在结束时校验两目录非空。
@@ -41,9 +45,15 @@ env:
   KERNEL_BIN: netcore_n60-pro-kernel.bin
   DEVICE_GLOB: '*n60-pro*'
   DEVICE_SYMBOL: CONFIG_TARGET_mediatek_filogic_DEVICE_netcore_n60-pro
-  # defconfig 之后必须仍然存在的关键包（丢了说明 feeds/DIY 出错）：
-  # sing-box 本体 + 代理工具所需依赖
-  MUST_KEEP_PACKAGES: CONFIG_PACKAGE_sing-box CONFIG_PACKAGE_kmod-tun CONFIG_PACKAGE_kmod-nft-tproxy
+  # defconfig 之后必须仍然存在的关键包（丢了说明 feeds / 第三方包源 / DIY 出错）：
+  #   sing-box 本体 + 代理工具所需 kmod
+  #   easytier 本体与中文 LuCI
+  #   momo 本体与中文 LuCI
+  MUST_KEEP_PACKAGES: >-
+    CONFIG_PACKAGE_sing-box CONFIG_PACKAGE_kmod-tun CONFIG_PACKAGE_kmod-nft-tproxy
+    CONFIG_PACKAGE_easytier CONFIG_EASYTIER_INCLUDE_WEBCONSOLE
+    CONFIG_PACKAGE_luci-app-easytier CONFIG_PACKAGE_luci-i18n-easytier-zh-cn
+    CONFIG_PACKAGE_momo CONFIG_PACKAGE_luci-app-momo CONFIG_PACKAGE_luci-i18n-momo-zh-cn
   UBI_506M: 0x0580000 0x1fa80000
   UBI_490M: 0x0580000 0x1ea00000
   TAG_506M: netcore-n60pro-immortal-506m
@@ -103,8 +113,24 @@ jobs:
       - name: Clone package
         run: |
           cd openwrt
-          # 只加明确定义的第三方 feed；momo / easytier 不再从 feed 源码编译（固件不预装它们）
+          # 只加明确定义的第三方 feed
           sed -i '1i src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' feeds.conf.default
+
+          # momo / easytier 不走 feed，直接整仓 clone 到 package/ 下：
+          # 两个仓库的根目录本身就是包集合，包在 package/<repo>/<pkg>/，正好是 OpenWrt 的扫描深度。
+          git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git package/easytier
+          git clone --depth 1 https://github.com/nikkinikki-org/OpenWrt-momo.git package/momo
+
+          # easytier 与 easytier-noweb 提供的是同一批可执行文件，二者互斥，只保留带 web 面板的 easytier
+          rm -rf package/easytier/easytier-noweb
+
+          # 目录结构变了就在这里炸掉，不要留到 make defconfig 时静默丢包
+          for d in package/easytier/easytier/Makefile \
+                   package/easytier/luci-app-easytier/Makefile \
+                   package/momo/momo/Makefile \
+                   package/momo/luci-app-momo/Makefile; do
+            [ -f "$d" ] || { echo "ERROR: 第三方包目录缺失 $d"; ls -R package/easytier package/momo 2>/dev/null | head -40; exit 1; }
+          done
 
       - name: Generate Variables
         run: |
@@ -175,7 +201,7 @@ jobs:
             echo "WARNING: make defconfig 丢弃了以下已选项（换源后符号变化属正常，但需确认）："
             cat /tmp/config.lost
           fi
-          # 关键插件必须还在，否则说明 feeds 安装或 DIY 出了问题
+          # 关键插件必须还在，否则说明 feeds / 第三方包源 / DIY 出了问题
           for sym in $MUST_KEEP_PACKAGES; do
             grep -q "^${sym}=y" .config || { echo "ERROR: defconfig 后 ${sym} 丢失，请检查 feeds/DIY"; exit 1; }
           done
@@ -335,6 +361,7 @@ jobs:
             Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
             分区布局：spi-nand-512MB-ubi-506.5MB（ubi ${{ env.UBI_506M }}）
 
+            预装：momo（含中文 LuCI）、easytier（含中文 LuCI）、sing-box
             默认地址：192.168.12.1  默认用户：root  默认密码：password
             源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
           artifacts: fw/506m/*
@@ -351,6 +378,7 @@ jobs:
             Netcore N60 Pro / MT7986A / 2GB DDR4 / 512MB SPI NAND
             分区布局：spi-nand-512MB-ubi-490MB（ubi ${{ env.UBI_490M }}）
 
+            预装：momo（含中文 LuCI）、easytier（含中文 LuCI）、sing-box
             默认地址：192.168.12.1  默认用户：root  默认密码：password
             源码：immortalwrt master @ ${{ env.SOURCE_COMMIT }}（${{ env.SOURCE_DATE }}）
           artifacts: fw/490m/*
