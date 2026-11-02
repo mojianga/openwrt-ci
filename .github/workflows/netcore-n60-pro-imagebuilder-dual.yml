@@ -3,7 +3,7 @@ name: netcore-n60pro-imagebuilder-dual
 # 思路：
 #   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
 #   2) sing-box 仍然装 immortalwrt 的包（满足 momo 依赖、提供 init/config），但二进制用官方 release 覆盖
-#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs，load/entry/版本/压缩/架构全部从 FIT 动态解析
+#   3) 从产物 itb 里拆出 kernel / 原始 dtb / rootfs
 #   4) 改 dtb 的 ubi 分区为 506.5M / 490M，用官方同参数的 mkits.sh + mkimage 重打两个 itb
 #   5) 回填原 itb 尾部的 metadata，发布到两个 Release
 #
@@ -274,8 +274,7 @@ jobs:
           echo "positions: kernel=$KER_POS fdt=$FDT_POS rootfs=$RFS_POS"
           [ -n "$KER_POS" ] && [ -n "$FDT_POS" ] && [ -n "$RFS_POS" ] || { echo "ERROR: FIT 结构解析失败"; cat fit-base.txt; exit 1; }
 
-          # 内核 load/entry、版本、压缩方式、架构、config 名全部从原 FIT 读，
-          # 内核或打包方式升级后这里不需要改（6.6 -> 6.18 的地址变化已经踩过一次）
+          # 内核 load/entry 与版本必须从原 FIT 读，硬编码会在内核升级后失效（6.6 -> 6.18 地址已变）
           KLOAD=$(awk '/Load Address:/{print $3; exit}' fit-base.txt)
           KENTRY=$(awk '/Entry Point:/{print $3; exit}' fit-base.txt)
           KVER=$(sed -n 's/.*OpenWrt Linux-\([0-9][0-9.]*\).*/\1/p' fit-base.txt | head -1)
@@ -308,18 +307,26 @@ jobs:
             echo "KERNEL_CONF=$KCONF"
           } >> $GITHUB_ENV
 
-          # 按 position 提取，不要加 -T：dumpimage 对 filesystem 类型会做类型校验并直接失败
-          dumpimage -p "$KER_POS" -o kernel.gz base.itb
-          dumpimage -p "$FDT_POS" -o orig.dtb base.itb
-          if ! dumpimage -p "$RFS_POS" -o rootfs.bin base.itb 2>/dev/null || [ ! -s rootfs.bin ]; then
-            echo "WARNING: dumpimage 提取 rootfs 失败，改用 squashfs magic 定位"
-            RFS_SIZE=$(awk -v want="$RFS_POS" '/Image [0-9]+ \(/{pos=$2} /Data Size:/{if (pos==want) {print $3; exit}}' fit-base.txt)
-            ROFF=$(grep -abo 'hsqs' base.itb | head -1 | cut -d: -f1)
-            echo "squashfs offset=$ROFF data_size=$RFS_SIZE"
-            [ -n "$ROFF" ] && [ -n "$RFS_SIZE" ] || { echo "ERROR: 无法定位 rootfs"; exit 1; }
-            tail -c +"$((ROFF + 1))" base.itb | head -c "$RFS_SIZE" > rootfs.bin
-          fi
-          unsquashfs -s rootfs.bin > /dev/null || { echo "ERROR: rootfs.bin 不是有效 squashfs"; ls -l rootfs.bin; exit 1; }
+          # dumpimage 的 -T 是必需的（不带会报 unsupported type: Invalid Image），
+          # 但 -T filesystem 在 ubuntu 的 u-boot-tools 上不被识别，所以 rootfs 改用 squashfs magic 定位
+          dumpimage -T kernel  -p "$KER_POS" -o kernel.gz base.itb
+          dumpimage -T flat_dt -p "$FDT_POS" -o orig.dtb  base.itb
+
+          RFS_SIZE=$(awk -v want="$RFS_POS" '/Image [0-9]+ \(/{pos=$2} /Data Size:/{if (pos==want) {print $3; exit}}' fit-base.txt)
+          [ -n "$RFS_SIZE" ] || { echo "ERROR: 拿不到 rootfs 的 Data Size"; cat fit-base.txt; exit 1; }
+          FOUND=""
+          for CAND in $(grep -abo 'hsqs' base.itb | cut -d: -f1); do
+            tail -c +"$((CAND + 1))" base.itb | head -c "$RFS_SIZE" > rootfs.cand
+            if unsquashfs -s rootfs.cand > /dev/null 2>&1; then
+              mv rootfs.cand rootfs.bin
+              FOUND=$CAND
+              break
+            fi
+          done
+          rm -f rootfs.cand
+          [ -n "$FOUND" ] || { echo "ERROR: 在 itb 里找不到有效的 squashfs"; exit 1; }
+          echo "rootfs squashfs offset=$FOUND size=$RFS_SIZE"
+          unsquashfs -s rootfs.bin > /dev/null || { echo "ERROR: rootfs.bin 不是有效 squashfs"; exit 1; }
           ls -lh kernel.gz orig.dtb rootfs.bin
 
           # 顺带校验官方 sing-box 是否真的覆盖进了 rootfs
@@ -420,9 +427,7 @@ jobs:
           body: |
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_506M }}
-            默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
             sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
             刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
           artifacts: out/506m/*
@@ -438,9 +443,7 @@ jobs:
           body: |
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_490M }}
-            默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
+            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）
             sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
             刷机：跨分区必须从 recovery initramfs 刷入，不要保留配置（sysupgrade -n）
           artifacts: out/490m/*
