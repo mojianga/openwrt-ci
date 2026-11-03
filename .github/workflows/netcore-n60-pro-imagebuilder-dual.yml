@@ -334,26 +334,32 @@ jobs:
                 exit 1
               fi
               # 3) LuCI / PPPoE / IPv6 关键件在位
-              for F in /usr/sbin/uhttpd /usr/sbin/rpcd \
+              #    注意：rpcd 在 OpenWrt 里装到 /sbin/rpcd（不是 /usr/sbin/rpcd），两个路径都认
+              RPCD=""
+              for C in /sbin/rpcd /usr/sbin/rpcd; do
+                if [ -x "$TARGET$C" ]; then RPCD="$C"; break; fi
+              done
+              [ -n "$RPCD" ] || { echo "ERROR: rootfs 里没有 rpcd（/sbin 或 /usr/sbin）"; exit 1; }
+              echo "  OK  $RPCD"
+
+              for F in /usr/sbin/uhttpd \
                        /www/luci-static/bootstrap/cascade.css \
                        /usr/lib/lua/luci/controller/easytier.lua \
+                       /usr/lib/lua/luci/i18n/easytier.zh-cn.lmo \
                        /usr/sbin/pppd /usr/sbin/odhcp6c /usr/sbin/odhcpd; do
-                [ -e "$TARGET$F" ] && echo "  OK  $F" || echo "  MISS $F"
+                [ -e "$TARGET$F" ] || { echo "ERROR: rootfs 缺少 $F"; exit 1; }
+                echo "  OK  $F"
               done
-              if [ ! -e "$TARGET/usr/sbin/uhttpd" ] || [ ! -e "$TARGET/usr/lib/lua/luci/controller/easytier.lua" ]; then
-                echo "ERROR: LuCI 关键文件缺失（uhttpd 或 easytier controller），界面不会出现"
-                exit 1
-              fi
-              # PPPoE 插件路径带 pppd 版本号，用通配匹配
-              if ! ls "$TARGET"/usr/lib/pppd/*/rp-pppoe.so >/dev/null 2>&1; then
-                echo "ERROR: 缺少 pppd 的 rp-pppoe.so 插件，PPPoE 拨号不可用"
+
+              # PPPoE 插件路径带 pppd 版本号，文件名是 pppoe.so
+              # （rp-pppoe.so 是 Debian/Ubuntu 的叫法，OpenWrt 的 ppp-mod-pppoe 装的是 pppoe.so）
+              PPPOE_SO=$(ls "$TARGET"/usr/lib/pppd/*/pppoe.so 2>/dev/null | head -1)
+              if [ -z "$PPPOE_SO" ]; then
+                echo "ERROR: 缺少 pppd 的 pppoe.so 插件，PPPoE 拨号不可用"
                 ls -R "$TARGET/usr/lib/pppd" 2>/dev/null | head -20
                 exit 1
               fi
-              if [ ! -e "$TARGET/usr/sbin/odhcp6c" ] || [ ! -e "$TARGET/usr/sbin/odhcpd" ]; then
-                echo "ERROR: IPv6 组件缺失（odhcp6c/odhcpd），IPv6 不可用"
-                exit 1
-              fi
+              echo "  OK  ${PPPOE_SO#$TARGET}"
             fi
           done
 
