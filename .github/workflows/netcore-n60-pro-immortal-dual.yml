@@ -22,9 +22,9 @@ name: netcore-n60-pro-immortal-dual
 # 前置要求：configs/netcore-n60-pro-immortal.config 里不能有 CONFIG_IB / CONFIG_IB_STANDALONE / CONFIG_SDK
 
 on:
-  workflow_dispatch:
-  watch:
-    types: [started]
+  # workflow_dispatch:
+  # watch:
+    # types: [started]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
