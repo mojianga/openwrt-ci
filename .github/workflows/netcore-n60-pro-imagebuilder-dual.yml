@@ -1,8 +1,12 @@
 name: netcore-n60pro-imagebuilder-dual
 
 # 思路：
-#   1) 官方 ImageBuilder 组装 rootfs（momo/meow 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
-#   2) sing-box 仍然装 immortalwrt 的包（满足 momo 依赖、提供 init/config），但二进制用官方 release 覆盖
+#   1) 官方 ImageBuilder 组装 rootfs（momo 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
+#   2) sing-box 装 immortalwrt 源里的包（满足 momo 依赖、提供 init/config），
+#      再用官方 release 的 sing-box-<ver>-linux-arm64-musl.tar.gz 覆盖 /usr/bin/sing-box。
+#      ——绝对不要用默认的 sing-box-<ver>-linux-arm64.tar.gz：那是 glibc 动态链接，
+#        OpenWrt 是 musl（/lib/ld-musl-aarch64.so.1），刷进去必然「无法执行」。
+#      LuCI 界面必须装齐 luci/luci-base/luci-mod-*/主题/uhttpd/rpcd，只装 luci-compat 是没有页面的。
 #   3) 改 build_dir 里的 image-*.dtb 的 ubi 分区为 506.5M / 490M，再各跑一次 make image
 #   4) 让 ImageBuilder 自己重打 FIT（hash/load/压缩/metadata 全自动），校验后再发布
 #
@@ -19,10 +23,6 @@ on:
     inputs:
       easytier_version:
         description: 'EasyTier tag（留空=latest）'
-        required: false
-        default: ''
-      meow_version:
-        description: 'meow tag（留空=latest）'
         required: false
         default: ''
       singbox_version:
@@ -48,7 +48,16 @@ env:
   DEVICE_NAME: netcore-n60-pro
   UBI_506M: 0x0580000 0x1fa80000
   UBI_490M: 0x0580000 0x1ea00000
-  PKGS_BASE: luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn ca-bundle curl firewall4 ip-full kmod-tun kmod-dummy kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn sing-box momo luci-app-momo luci-i18n-momo-zh-cn
+  # LuCI 界面必须显式装「框架 + 模块 + 主题 + web 服务」，只装 luci-compat/luci-lib-* 是没有页面的。
+  # sing-box 仍装源里的包（提供 /etc/init.d/sing-box 与 /etc/config/sing-box、满足 momo 依赖），
+  # 但 /usr/bin/sing-box 会被官方 musl 二进制通过 FILES 覆盖掉。
+  #
+  # PPPoE 拨号：ppp + ppp-mod-pppoe（用户态），kmod-ppp/pppoe/pppox（内核），luci-proto-ppp（界面）
+  # IPv6：odhcp6c（WAN 侧 DHCPv6-PD 客户端，PPPoE 下拿前缀），odhcpd-ipv6only（LAN 侧 RA/DHCPv6），
+  #       luci-proto-ipv6（界面）
+  PKGS_PPPOE: ppp ppp-mod-pppoe kmod-ppp kmod-pppoe kmod-pppox luci-proto-ppp
+  PKGS_IPV6: odhcp6c odhcpd-ipv6only luci-proto-ipv6
+  PKGS_BASE: luci luci-base luci-mod-network luci-mod-system luci-mod-status luci-theme-bootstrap uhttpd uhttpd-mod-ubus rpcd rpcd-mod-luci rpcd-mod-file rpcd-mod-rrdns luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn bash ca-bundle curl firewall4 ip-full sing-box kmod-tun kmod-dummy kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn momo luci-app-momo luci-i18n-momo-zh-cn
   TAG_506M: netcore-n60pro-ib-506m
   TAG_490M: netcore-n60pro-ib-490m
 
@@ -71,7 +80,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get -y update
-          sudo -E apt-get -y install zstd unzip jq device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev
+          sudo -E apt-get -y install zstd unzip jq device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev binutils
 
       - name: Download ImageBuilder
         run: |
@@ -109,7 +118,7 @@ jobs:
           echo "--- keys ---"
           ls -l keys
 
-      - name: Allow untrusted apk (meow 的 apk 没有公钥)
+      - name: Allow untrusted apk (momo 用自带公钥，其余未签名包放行)
         run: |
           cd "$IB_DIR"
           cp Makefile Makefile.orig
@@ -139,34 +148,11 @@ jobs:
           ls -l pkgs/et
           [ -f pkgs/et/easytier-core ] || { echo "ERROR: zip 里没有 easytier-core"; exit 1; }
 
-      - name: Fetch meow apk
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p pkgs
-          TAG="${{ inputs.meow_version }}"
-          if [ -z "$TAG" ]; then
-            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                   https://api.github.com/repos/meow-rs/meow-rs/releases/latest \
-                 | jq -r '.tag_name')
-          fi
-          [ -n "$TAG" ] || { echo "ERROR: 取 meow 版本失败"; exit 1; }
-          echo "meow tag = $TAG"
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/meow-rs/meow-rs/releases/tags/${TAG}" > /tmp/meow.json
-          MEOW_URL=$(jq -r '.assets[].browser_download_url' /tmp/meow.json \
-                     | grep -E "/meow_[^/]*_${PKG_ARCH}\.apk\$" | head -1)
-          LUCI_URL=$(jq -r '.assets[].browser_download_url' /tmp/meow.json \
-                     | grep -E "/luci-app-meow_[^/]*_all\.apk\$" | head -1)
-          [ -n "$MEOW_URL" ] || { echo "ERROR: 没找到 meow 的 ${PKG_ARCH} apk"; jq -r '.assets[].name' /tmp/meow.json; exit 1; }
-          [ -n "$LUCI_URL" ] || { echo "ERROR: 没找到 luci-app-meow apk"; jq -r '.assets[].name' /tmp/meow.json; exit 1; }
-          echo "meow: $MEOW_URL"
-          echo "luci: $LUCI_URL"
-          curl -fL --retry 3 -o pkgs/meow.apk "$MEOW_URL"
-          curl -fL --retry 3 -o pkgs/luci-app-meow.apk "$LUCI_URL"
-          ls -lh pkgs/*.apk
-
-      - name: Fetch official sing-box (replace immortalwrt's old one)
+      # 关键：OpenWrt 用的是 musl。官方 release 里同样有 -musl 变体，
+      # 而默认的 sing-box-<ver>-linux-arm64.tar.gz 是 glibc 动态链接
+      # （interpreter = /lib/ld-linux-aarch64.so.1），刷进固件后必然「无法执行」。
+      # 所以这里固定取 -musl 包，稍后由 FILES 覆盖源包里那份旧二进制。
+      - name: Fetch sing-box (linux-arm64-musl)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -179,18 +165,16 @@ jobs:
           fi
           [ -n "$TAG" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
           VER=${TAG#v}
-          echo "sing-box tag = $TAG"
-          MAJOR=$(echo "$VER" | cut -d. -f1)
-          MINOR=$(echo "$VER" | cut -d. -f2)
-          if ! { [ "$MAJOR" -ge 1 ] && [ "$MINOR" -ge 12 ]; }; then
-            echo "ERROR: sing-box $VER < 1.12，momo 不兼容"
-            exit 1
-          fi
-          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64.tar.gz"
+          echo "sing-box tag = $TAG (ver = $VER)"
+          # 用 sort -V 做版本比较，避免 1.9 / 2.0 之类被数字大小误判
+          LOWEST=$(printf '%s\n%s\n' "$VER" "1.12.0" | sort -V | head -1)
+          [ "$LOWEST" = "1.12.0" ] || { echo "ERROR: sing-box $VER < 1.12，momo 不兼容"; exit 1; }
+
+          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64-musl.tar.gz"
           echo "URL=$URL"
           curl -fL --retry 3 -o pkgs/sing-box.tar.gz "$URL"
           tar -xzf pkgs/sing-box.tar.gz -C pkgs
-          BIN=$(find pkgs -type f -path "*sing-box-${VER}-linux-arm64/sing-box" | head -1)
+          BIN=$(find pkgs -type f -path "*linux-arm64-musl*" -name sing-box | head -1)
           [ -n "$BIN" ] || BIN=$(find pkgs -type f -name sing-box | head -1)
           [ -n "$BIN" ] || { echo "ERROR: 解压后没找到 sing-box 二进制"; find pkgs -maxdepth 3; exit 1; }
           install -m 0755 "$BIN" pkgs/sing-box-bin
@@ -198,8 +182,20 @@ jobs:
           file pkgs/sing-box-bin
           case "$(file -b pkgs/sing-box-bin)" in
             *aarch64*|*ARM*) echo "架构 OK" ;;
-            *) echo "ERROR: sing-box 二进制架构不对"; exit 1 ;;
+            *) echo "ERROR: sing-box 二进制架构不是 aarch64"; exit 1 ;;
           esac
+          # 显式拒绝 glibc 动态链接（这才是它在 MT7986/musl 上跑不起来的根因）
+          readelf -l pkgs/sing-box-bin > /tmp/sb.elf 2>/dev/null || true
+          if grep -q "interpreter" /tmp/sb.elf; then
+            INTERP=$(sed -n 's/.*interpreter: \(.*\)\]/\1/p' /tmp/sb.elf | head -1)
+            echo "interpreter = $INTERP"
+            case "$INTERP" in
+              *musl*) echo "musl 动态链接，OK" ;;
+              *) echo "ERROR: 动态链接到 $INTERP，OpenWrt 是 musl，刷机后无法执行"; exit 1 ;;
+            esac
+          else
+            echo "静态链接（无 interpreter），OK"
+          fi
           ls -lh pkgs/sing-box-bin
 
       - name: Build FILES overlay (easytier + luci + i18n)
@@ -207,15 +203,15 @@ jobs:
           git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
 
           mkdir -p files/usr/bin
+          # easytier 用 noweb 形态：只装 core + cli，不装 easytier-web / easytier-web-embed，
+          # 免得固件里多一个 8080 端口的 web 服务和它带来的依赖。
           cp -a pkgs/et/easytier-core pkgs/et/easytier-cli files/usr/bin/
-          if [ -f pkgs/et/easytier-web-embed ]; then
-            cp -a pkgs/et/easytier-web-embed files/usr/bin/easytier-web
-          elif [ -f pkgs/et/easytier-web ]; then
-            cp -a pkgs/et/easytier-web files/usr/bin/easytier-web
+          if [ -e pkgs/et/easytier-web-embed ] || [ -e pkgs/et/easytier-web ]; then
+            echo "检测到 easytier-web，按 noweb 策略不安装"
           fi
           chmod 0755 files/usr/bin/easytier-*
 
-          # 官方 sing-box 覆盖 immortalwrt 包里的旧二进制（FILES 在包安装之后拷贝）
+          # 官方 musl 二进制覆盖源包里的旧 sing-box（FILES 在包安装之后拷贝）
           install -D -m 0755 pkgs/sing-box-bin files/usr/bin/sing-box
 
           # luci：luasrc -> /usr/lib/lua/luci，root -> /
@@ -261,7 +257,8 @@ jobs:
       - name: Make image (baseline, 128M layout)
         run: |
           cd "$IB_DIR"
-          PACKAGES="$PKGS_BASE $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          PACKAGES="$PKGS_BASE $PKGS_PPPOE $PKGS_IPV6"
+          echo "PACKAGES=$PACKAGES"
           make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
           echo "===== 产物 ====="
           ls -lh bin/targets/mediatek/filogic/
@@ -271,7 +268,8 @@ jobs:
       - name: Repack two itb (patch dtb + make image)
         run: |
           cd "$IB_DIR"
-          PACKAGES="$PKGS_BASE $GITHUB_WORKSPACE/pkgs/meow.apk $GITHUB_WORKSPACE/pkgs/luci-app-meow.apk"
+          PACKAGES="$PKGS_BASE $PKGS_PPPOE $PKGS_IPV6"
+          echo "PACKAGES=$PACKAGES"
           DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
           if [ -z "$DTB" ]; then
             echo "build_dir 里没有 dtb，先跑一次 make image 生成"
@@ -318,16 +316,44 @@ jobs:
             cp -f "$NEW" "itb-$NAME.itb"
             ls -lh "itb-$NAME.itb"
 
-            # 校验 FILES 覆盖是否生效：ImageBuilder 的 TARGET_DIR 在 make image 后仍保留
+            # 校验 rootfs：ImageBuilder 的 TARGET_DIR 在 make image 后仍保留
             TARGET=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
-            if [ -n "$TARGET" ] && [ -f "$TARGET/usr/bin/sing-box" ]; then
+            if [ -z "$TARGET" ]; then
+              echo "WARNING: 找不到 TARGET_DIR，跳过 rootfs 校验"
+            else
+              # 1) sing-box 必须是官方 musl 二进制（FILES 覆盖生效）
+              [ -f "$TARGET/usr/bin/sing-box" ] || { echo "ERROR: rootfs 里没有 /usr/bin/sing-box"; exit 1; }
               IN_SHA=$(sha256sum "$TARGET/usr/bin/sing-box" | cut -d' ' -f1)
               WANT_SHA=$(sha256sum "$GITHUB_WORKSPACE/pkgs/sing-box-bin" | cut -d' ' -f1)
               echo "rootfs sing-box sha256 = $IN_SHA"
               [ "$IN_SHA" = "$WANT_SHA" ] \
-                || { echo "ERROR: rootfs 里的 sing-box 不是官方二进制（FILES 覆盖没生效）"; exit 1; }
-            else
-              echo "WARNING: 找不到 TARGET_DIR（$TARGET），跳过 sing-box 覆盖校验"
+                || { echo "ERROR: rootfs 里的 sing-box 不是官方 musl 二进制（FILES 覆盖没生效）"; exit 1; }
+              # 2) easytier 必须是 noweb 形态：不应该有 easytier-web
+              if [ -e "$TARGET/usr/bin/easytier-web" ]; then
+                echo "ERROR: 固件里出现了 easytier-web，应为 noweb 形态"
+                exit 1
+              fi
+              # 3) LuCI / PPPoE / IPv6 关键件在位
+              for F in /usr/sbin/uhttpd /usr/sbin/rpcd \
+                       /www/luci-static/bootstrap/cascade.css \
+                       /usr/lib/lua/luci/controller/easytier.lua \
+                       /usr/sbin/pppd /usr/sbin/odhcp6c /usr/sbin/odhcpd; do
+                [ -e "$TARGET$F" ] && echo "  OK  $F" || echo "  MISS $F"
+              done
+              if [ ! -e "$TARGET/usr/sbin/uhttpd" ] || [ ! -e "$TARGET/usr/lib/lua/luci/controller/easytier.lua" ]; then
+                echo "ERROR: LuCI 关键文件缺失（uhttpd 或 easytier controller），界面不会出现"
+                exit 1
+              fi
+              # PPPoE 插件路径带 pppd 版本号，用通配匹配
+              if ! ls "$TARGET"/usr/lib/pppd/*/rp-pppoe.so >/dev/null 2>&1; then
+                echo "ERROR: 缺少 pppd 的 rp-pppoe.so 插件，PPPoE 拨号不可用"
+                ls -R "$TARGET/usr/lib/pppd" 2>/dev/null | head -20
+                exit 1
+              fi
+              if [ ! -e "$TARGET/usr/sbin/odhcp6c" ] || [ ! -e "$TARGET/usr/sbin/odhcpd" ]; then
+                echo "ERROR: IPv6 组件缺失（odhcp6c/odhcpd），IPv6 不可用"
+                exit 1
+              fi
             fi
           done
 
@@ -370,9 +396,14 @@ jobs:
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_506M }}
             默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
-            sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
+            预装：momo（含中文 LuCI）、sing-box、easytier noweb（含中文 LuCI）、UPnP（含中文 LuCI）
+            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*、kmod-ppp/pppoe/pppox
+            拨号：支持 PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp，LuCI 协议里可选）
+            IPv6：默认开启（odhcp6c 拿 DHCPv6-PD，odhcpd 下发 RA/DHCPv6，luci-proto-ipv6 可配）
+            界面：完整 LuCI（luci-base + luci-mod-network/system/status + bootstrap 主题 + uhttpd + rpcd），默认中文
+            sing-box：包来自源（提供 init/config），二进制替换为官方 sing-box-<ver>-linux-arm64-musl，可在 MT7986A 上直接执行
+            easytier：noweb 形态，仅 easytier-core + easytier-cli，不含 easytier-web/easytier-web-embed
+            Shell：预装 bash（默认 shell 仍为 busybox ash，需要时 `bash` 进入）
             刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
           artifacts: out/506m/*
           allowUpdates: true
@@ -388,9 +419,14 @@ jobs:
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
             ubi 分区：${{ env.UBI_490M }}
             默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、meow、easytier（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*
-            sing-box：官方 release 二进制（>= 1.12），非 immortalwrt 源内旧版本
+            预装：momo（含中文 LuCI）、sing-box、easytier noweb（含中文 LuCI）、UPnP（含中文 LuCI）
+            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*、kmod-ppp/pppoe/pppox
+            拨号：支持 PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp，LuCI 协议里可选）
+            IPv6：默认开启（odhcp6c 拿 DHCPv6-PD，odhcpd 下发 RA/DHCPv6，luci-proto-ipv6 可配）
+            界面：完整 LuCI（luci-base + luci-mod-network/system/status + bootstrap 主题 + uhttpd + rpcd），默认中文
+            sing-box：包来自源（提供 init/config），二进制替换为官方 sing-box-<ver>-linux-arm64-musl，可在 MT7986A 上直接执行
+            easytier：noweb 形态，仅 easytier-core + easytier-cli，不含 easytier-web/easytier-web-embed
+            Shell：预装 bash（默认 shell 仍为 busybox ash，需要时 `bash` 进入）
             刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
           artifacts: out/490m/*
           allowUpdates: true
