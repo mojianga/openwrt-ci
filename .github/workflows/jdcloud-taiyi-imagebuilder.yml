@@ -40,7 +40,7 @@ on:
     types: [started]
   # 定时触发（cron 只有 UTC，没有时区参数）
   schedule:
-    - cron: '0 3 * * 1'    # 每周一 03:00 UTC = 北京时间 周一 11:00
+    - cron: '0 3 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
