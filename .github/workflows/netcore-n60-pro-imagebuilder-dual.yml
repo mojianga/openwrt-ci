@@ -48,6 +48,9 @@ on:
   # 点 star 触发；watch 事件只会触发「默认分支」上的 workflow
   watch:
     types: [started]
+  # 定时触发（cron 只有 UTC，没有时区参数）
+  schedule:
+    - cron: '0 3 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
