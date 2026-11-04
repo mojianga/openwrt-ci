@@ -92,6 +92,14 @@ jobs:
           echo "ImageBuilder = $IB"
 
           cd "$IB"
+          # ImageBuilder 默认不产 initramfs 镜像（tarball 里的 .config 没开 INITRAMFS），
+          # 而首次刷机要靠它引导，所以这里显式打开；万一没开成功，verify 步骤只告警不失败。
+          if [ -f .config ]; then
+            grep -q '^CONFIG_TARGET_ROOTFS_INITRAMFS=y' .config \
+              || echo 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' >> .config
+            echo "initramfs 镜像: $(grep -c '^CONFIG_TARGET_ROOTFS_INITRAMFS=y' .config) 处开启"
+          fi
+
           # apk 3 的仓库条目要指向索引文件本身（写目录会被拼成 <dir>/<arch>/APKINDEX.tar.gz）
           if [ -f repositories ]; then
             echo "$MOMO_REPO/packages.adb" >> repositories
@@ -251,6 +259,16 @@ jobs:
           T=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
           [ -n "$T" ] || { echo "ERROR: 找不到 TARGET_DIR"; exit 1; }
 
+          # sysupgrade 必须有；initramfs 只告警（没开 INITRAMFS 时确实不产）
+          [ -s "$IMG/${BASE}-squashfs-sysupgrade.bin" ] \
+            || { echo "ERROR: 没有产出 squashfs-sysupgrade.bin"; ls -lh "$IMG"; exit 1; }
+          echo "  OK   $(basename "$IMG/${BASE}-squashfs-sysupgrade.bin") ($(du -h "$IMG/${BASE}-squashfs-sysupgrade.bin" | cut -f1))"
+          if [ -s "$IMG/${BASE}-initramfs-uImage.itb" ]; then
+            echo "  OK   $(basename "$IMG/${BASE}-initramfs-uImage.itb")"
+          else
+            echo "  WARN 没有 initramfs 镜像，首次刷机请用官方 downloads 里的 initramfs 引导"
+          fi
+
           fail=0
           need() { [ -e "$T$1" ] && echo "  OK   $1" || { echo "  MISS $1"; fail=1; }; }
           # 包按 apk 数据库校验（路径无关，比猜文件可靠）
@@ -296,7 +314,9 @@ jobs:
           # ---------- 收集产物 ----------
           OUT="$GITHUB_WORKSPACE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
           cp -f "$IMG/${BASE}-squashfs-sysupgrade.bin" "$OUT/"
-          cp -f "$IMG/${BASE}-initramfs-uImage.itb"    "$OUT/"
+          if [ -s "$IMG/${BASE}-initramfs-uImage.itb" ]; then
+            cp -f "$IMG/${BASE}-initramfs-uImage.itb" "$OUT/"
+          fi
           {
             echo "device  : JDCloud ${DEVICE_NAME} (${PROFILE})"
             echo "openwrt : ${OPENWRT_VER}"
@@ -334,6 +354,8 @@ jobs:
             刷机：
             1. 需第三方 U-Boot（uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin，machid 0x8030202；不要用 cs-02 的）
             2. 官方 profile 没有 factory：先在 U-Boot 里引导 initramfs-uImage.itb
+               （若本次没有 initramfs 附件，用 downloads.openwrt.org 同 snapshot 的 initramfs 引导即可，
+                它只负责把系统跑起来，写完 sysupgrade 后就被覆盖）
             3. 进系统后 `sysupgrade -n <squashfs-sysupgrade.bin>` 写 eMMC（首次刷写不要保留配置）
 
             momo：打开 http://${{ env.LAN_IP }} → 服务 → Momo，粘贴 sing-box 配置/订阅，选 TUN 或 TPROXY 后启用；
