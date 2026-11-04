@@ -337,7 +337,6 @@ jobs:
         with:
           tag: ${{ env.RELEASE_TAG }}
           name: OpenWrt JDCloud Taiyi RE-CS-07 (snapshot + LuCI + momo + easytier)
-          prerelease: true
           allowUpdates: true
           removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
