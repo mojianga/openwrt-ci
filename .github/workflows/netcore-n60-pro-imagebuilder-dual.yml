@@ -1,34 +1,50 @@
-name: netcore-n60pro-imagebuilder-dual
+name: netcore-n60pro-imagebuilder-506m
 
-# 思路：
-#   1) 官方 ImageBuilder 组装 rootfs（momo 走 apk，easytier 走 release 二进制 + luci 源码 FILES 注入）
-#   2) sing-box 装 immortalwrt 源里的包（满足 momo 依赖、提供 init/config），
-#      再用官方 release 的 sing-box-<ver>-linux-arm64-musl.tar.gz 覆盖 /usr/bin/sing-box。
+# 思路（全部基于官方 OpenWrt，不再用 ImmortalWrt）：
+#   1) 官方 ImageBuilder 组装 rootfs
+#      - 默认跟 snapshot（内核 6.18.x，最新驱动；momo 自动走 SNAPSHOT 分支源）
+#      - 想要固定 ABI / 可复现就把 openwrt_version 填 25.12.6（内核 6.12.x，momo 走 openwrt-25.12 分支）
+#      - snapshot 是滚动的：kmod ABI 每天可能变，固件里的 kmod 必须与同一次构建的镜像配套
+#   2) 官方 packages 源里已有 sing-box（snapshot = 1.14.x / 25.12.6 = 1.13.21），
+#      但仍用官方 release 的 sing-box-<ver>-linux-arm64-musl.tar.gz 覆盖 /usr/bin/sing-box：
 #      ——绝对不要用默认的 sing-box-<ver>-linux-arm64.tar.gz：那是 glibc 动态链接，
 #        OpenWrt 是 musl（/lib/ld-musl-aarch64.so.1），刷进去必然「无法执行」。
+#      包本身留着是为了提供 init/config，并满足 momo 的依赖。
+#   3) momo / luci-app-momo / luci-i18n-momo-zh-cn 来自 momomomo.pages.dev，
+#      分支按 OpenWrt 版本自动选：25.12.x -> openwrt-25.12，snapshot -> SNAPSHOT。
 #      LuCI 界面必须装齐 luci/luci-base/luci-mod-*/主题/uhttpd/rpcd，只装 luci-compat 是没有页面的。
-#   3) 改 build_dir 里的 image-*.dtb 的 ubi 分区为 506.5M / 490M，再各跑一次 make image
-#   4) 让 ImageBuilder 自己重打 FIT（hash/load/压缩/metadata 全自动），校验后再发布
+#   4) easytier 走 release 二进制（noweb）+ luci 源码 FILES 注入 + 中文 lmo
+#   5) 只做 506.5M 一种分区：改 build_dir 里的 image-*.dtb 的 ubi 分区，再跑一次 make image
+#   6) 让 ImageBuilder 自己重打 FIT（hash/load/压缩/metadata 全自动），校验后再发布
 #
-# 触发方式：workflow_dispatch（可指定版本）或 点 star（watch: started，全部取 latest）
+# 触发方式：workflow_dispatch（可指定版本 / LAN IP）或 点 star（watch: started，全部取 latest）
 #
 # 注意（重要的刷机前提）：
-#   - 同分区间升级（506M -> 506M、490M -> 490M）可以直接 sysupgrade。
-#   - 跨分区（128M/506M/490M 之间互刷）必须用「目标分区表的内核」引导后刷写，
+#   - 默认跟 snapshot，每次构建的产物/内核都不一样；要固定版本就显式填 openwrt_version=25.12.6。
+#   - 同分区间升级（506M -> 506M）可以直接 sysupgrade。
+#   - 从 128M 原厂分区跨到 506M 必须用「目标分区表的内核」引导后刷写，
 #     而 ImageBuilder 不产出 initramfs/recovery 镜像；这种情况下请用 buildroot 版
-#     netcore-n60-pro-immortal-dual.yml 产出的 -recovery.itb 来刷，否则 UBI 会按旧分区边界创建。
+#     产出的 -recovery.itb 来刷，否则 UBI 会按旧分区边界创建。
 
 on:
   workflow_dispatch:
     inputs:
+      openwrt_version:
+        description: 'OpenWrt 版本（默认 snapshot 跟主线；填 25.12.6 用正式版）'
+        required: false
+        default: 'snapshot'
       easytier_version:
         description: 'EasyTier tag（留空=latest）'
         required: false
         default: ''
       singbox_version:
-        description: 'sing-box tag（留空=latest 稳定版）'
+        description: 'sing-box tag（留空=latest 稳定版，需 >= 1.12）'
         required: false
         default: ''
+      lan_ip:
+        description: '默认 LAN IP'
+        required: false
+        default: '192.168.12.1'
   # 点 star 触发；watch 事件只会触发「默认分支」上的 workflow
   watch:
     types: [started]
@@ -41,15 +57,24 @@ permissions:
   contents: write
 
 env:
-  IB_URL: https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic/immortalwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst
+  # 官方 OpenWrt：release 或 snapshot 由 OPENWRT_VER 决定，IB_URL 在下载步骤里拼
+  OPENWRT_VER: ${{ github.event.inputs.openwrt_version || 'snapshot' }}
   PROFILE: netcore_n60-pro
   PKG_ARCH: aarch64_cortex-a53
-  MOMO_REPO: https://momomomo.pages.dev/SNAPSHOT/aarch64_cortex-a53/momo
+  # momo 的第三方源（按 OpenWrt 分支自动拼接），公钥用于 apk 验签
+  MOMO_BASE: https://momomomo.pages.dev
+  MOMO_KEY: https://momomomo.pages.dev/public-key.pem
   DEVICE_NAME: netcore-n60-pro
+  # 512MB NAND：ubi 起始 0x0580000 + 506.5MiB = 0x20000000
   UBI_506M: 0x0580000 0x1fa80000
-  UBI_490M: 0x0580000 0x1ea00000
+  TAG: netcore-n60pro-ib-506m
+  # LAN IP 抽成变量：workflow_dispatch 可覆盖，点 star 时走默认值
+  LAN_IP: ${{ github.event.inputs.lan_ip || '192.168.12.1' }}
+  # 触发方式不同时 inputs 为空，统一用 env 兜底
+  ET_TAG_INPUT: ${{ github.event.inputs.easytier_version }}
+  SB_TAG_INPUT: ${{ github.event.inputs.singbox_version }}
   # LuCI 界面必须显式装「框架 + 模块 + 主题 + web 服务」，只装 luci-compat/luci-lib-* 是没有页面的。
-  # sing-box 仍装源里的包（提供 /etc/init.d/sing-box 与 /etc/config/sing-box、满足 momo 依赖），
+  # sing-box 装源里的包（提供 /etc/init.d/sing-box 与 /etc/config/sing-box、满足 momo 依赖），
   # 但 /usr/bin/sing-box 会被官方 musl 二进制通过 FILES 覆盖掉。
   #
   # PPPoE 拨号：ppp + ppp-mod-pppoe（用户态），kmod-ppp/pppoe/pppox（内核），luci-proto-ppp（界面）
@@ -58,44 +83,94 @@ env:
   PKGS_PPPOE: ppp ppp-mod-pppoe kmod-ppp kmod-pppoe kmod-pppox luci-proto-ppp
   PKGS_IPV6: odhcp6c odhcpd-ipv6only luci-proto-ipv6
   PKGS_BASE: luci luci-base luci-mod-network luci-mod-system luci-mod-status luci-theme-bootstrap uhttpd uhttpd-mod-ubus rpcd rpcd-mod-luci rpcd-mod-file rpcd-mod-rrdns luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn bash ca-bundle curl firewall4 ip-full sing-box kmod-tun kmod-dummy kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-netlink-diag miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn momo luci-app-momo luci-i18n-momo-zh-cn
-  TAG_506M: netcore-n60pro-ib-506m
-  TAG_490M: netcore-n60pro-ib-490m
 
 jobs:
   build:
-    name: ImageBuilder N60 Pro (506M + 490M)
+    name: ImageBuilder N60 Pro (506.5MB)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     # workflow_dispatch 随时可跑；star 触发默认不限制触发人。
     # 想在公开仓库里只允许特定账号点星触发，就配仓库变量 STAR_ACTOR=<用户名>，
     # 配了之后只有该账号的 star 才会启动构建。
     if: github.event_name == 'workflow_dispatch' || vars.STAR_ACTOR == '' || github.actor == vars.STAR_ACTOR
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@main
-
+      # 不依赖仓库里的任何文件，省掉一次 checkout
       - name: Prepare
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          set -euo pipefail
           sudo -E apt-get -y update
-          sudo -E apt-get -y install zstd unzip jq device-tree-compiler u-boot-tools squashfs-tools python3 curl gcc libc6-dev binutils
+          sudo -E apt-get -y install --no-install-recommends \
+            zstd unzip jq device-tree-compiler u-boot-tools squashfs-tools \
+            python3 curl gcc libc6-dev binutils file
 
-      - name: Download ImageBuilder
+      - name: Download ImageBuilder (official OpenWrt)
         run: |
+          set -euo pipefail
+          case "$OPENWRT_VER" in
+            snapshot|SNAPSHOT|snapshots)
+              BASE_URL=https://downloads.openwrt.org/snapshots
+              DISTRIB=SNAPSHOT
+              ;;
+            *)
+              BASE_URL=https://downloads.openwrt.org/releases/${OPENWRT_VER}
+              DISTRIB=$OPENWRT_VER
+              ;;
+          esac
+
+          # 正式版的 imagebuilder 文件名带版本号（openwrt-imagebuilder-<ver>-mediatek-filogic...），
+          # snapshot 不带；按顺序探一遍，省得换版本时手改
+          CANDIDATES="openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
+          if [ "$DISTRIB" != "SNAPSHOT" ]; then
+            CANDIDATES="openwrt-imagebuilder-${DISTRIB}-mediatek-filogic.Linux-x86_64.tar.zst ${CANDIDATES}"
+          fi
+          IB_FILE=""
+          for NAME in $CANDIDATES; do
+            if curl -fsIL --retry 2 --max-time 30 "${BASE_URL}/targets/mediatek/filogic/${NAME}" > /dev/null; then
+              IB_FILE=$NAME
+              break
+            fi
+          done
+          [ -n "$IB_FILE" ] || { echo "ERROR: 在 $BASE_URL 找不到 $DISTRIB 的 ImageBuilder（版本号写错了？）"; exit 1; }
+
+          IB_URL="${BASE_URL}/targets/mediatek/filogic/${IB_FILE}"
+          echo "OpenWrt = $DISTRIB"
+          echo "IB_URL  = $IB_URL"
+
           curl -fL --retry 3 --retry-delay 5 -o ib.tar.zst "$IB_URL"
           ls -lh ib.tar.zst
           tar --zstd -xf ib.tar.zst
-          IB=$(ls -d "$PWD"/immortalwrt-imagebuilder-*)
+          IB=$(ls -d "$PWD"/openwrt-imagebuilder-* | head -1)
           [ -d "$IB" ] || { echo "ERROR: 解压后没找到 ImageBuilder 目录"; ls -al; exit 1; }
-          echo "IB_DIR=$IB" >> $GITHUB_ENV
+          echo "IB_DIR=$IB" >> "$GITHUB_ENV"
+
+          # 版本号（release 写 x.y.z，snapshot 取 git 描述），只用于 release 说明
+          BUILDINFO=$(curl -fsSL --retry 3 "${BASE_URL}/targets/mediatek/filogic/version.buildinfo" | head -1 | tr -d '\r\n' || true)
+          echo "OPENWRT_BUILD=${BUILDINFO:-$DISTRIB}" >> "$GITHUB_ENV"
+          echo "OPENWRT_DISTRIB=$DISTRIB" >> "$GITHUB_ENV"
+          echo "OpenWrt build = ${BUILDINFO:-$DISTRIB}"
+
           echo "ImageBuilder = $IB"
           ls -a "$IB" | head -30
 
       - name: Add momo apk repository
         run: |
+          set -euo pipefail
           cd "$IB_DIR"
+
+          # momo 的源按 OpenWrt 分支走：25.12.x -> openwrt-25.12，snapshot -> SNAPSHOT
+          if [ "$OPENWRT_DISTRIB" = "SNAPSHOT" ]; then
+            MOMO_BRANCH=SNAPSHOT
+          else
+            MOMO_BRANCH="openwrt-$(printf '%s' "$OPENWRT_DISTRIB" | cut -d. -f1,2)"
+          fi
+          MOMO_REPO="$MOMO_BASE/$MOMO_BRANCH/$PKG_ARCH/momo"
+          echo "MOMO_REPO = $MOMO_REPO"
+          echo "MOMO_REPO=$MOMO_REPO" >> "$GITHUB_ENV"
+          echo "MOMO_BRANCH=$MOMO_BRANCH" >> "$GITHUB_ENV"
+
           if [ -f repositories ]; then
             REPO_FILE=repositories
           elif [ -f repositories.conf ]; then
@@ -105,14 +180,21 @@ jobs:
             ls -a
             exit 1
           fi
+
           # apk 3 的仓库条目要指向索引文件本身（写目录会被拼成 <dir>/<arch>/APKINDEX.tar.gz）
+          curl -fsSL --retry 3 -o /dev/null "$MOMO_REPO/packages.adb" \
+            || { echo "ERROR: momo 源不可用（分支/架构目录可能没构建）: $MOMO_REPO"; exit 1; }
+
           case "$REPO_FILE" in
             repositories)      echo "$MOMO_REPO/packages.adb" >> "$REPO_FILE" ;;
             repositories.conf) echo "src/gz momo $MOMO_REPO" >> "$REPO_FILE" ;;
           esac
+
+          # momo 用自己的签名公钥；缺了这步 apk 会把 momo 的包判为不可信
           mkdir -p keys
-          curl -fsSL --retry 3 https://momomomo.pages.dev/public-key.pem -o keys/momo.pem
-          echo "REPO_FILE=$REPO_FILE" >> $GITHUB_ENV
+          curl -fsSL --retry 3 "$MOMO_KEY" -o keys/momo.pem
+
+          echo "REPO_FILE=$REPO_FILE" >> "$GITHUB_ENV"
           echo "--- $REPO_FILE ---"
           cat "$REPO_FILE"
           echo "--- keys ---"
@@ -120,50 +202,53 @@ jobs:
 
       - name: Allow untrusted apk (momo 用自带公钥，其余未签名包放行)
         run: |
+          set -euo pipefail
           cd "$IB_DIR"
-          cp Makefile Makefile.orig
           # ImageBuilder 的 package_install 实际执行：
           #   $(APK) add --arch $(ARCH_PACKAGES) --no-scripts $(BUILD_PACKAGES)
           sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
-          grep -n "PK) add" Makefile
-          grep -q "allow-untrusted" Makefile || { echo "ERROR: 没能给 apk add 加上 --allow-untrusted"; sed -n '255,275p' Makefile; exit 1; }
+          grep -n "PK) add" Makefile || true
+          grep -q "allow-untrusted" Makefile \
+            || { echo "ERROR: 没能给 apk add 加上 --allow-untrusted"; sed -n '255,275p' Makefile; exit 1; }
 
       - name: Fetch EasyTier binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p pkgs/et
-          TAG="${{ inputs.easytier_version }}"
+          TAG="${ET_TAG_INPUT:-}"
           if [ -z "$TAG" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                   https://api.github.com/repos/EasyTier/EasyTier/releases/latest \
-                 | jq -r '.tag_name')
+                   https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r '.tag_name')
           fi
-          [ -n "$TAG" ] || { echo "ERROR: 取 EasyTier 版本失败"; exit 1; }
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 EasyTier 版本失败"; exit 1; }
           echo "EasyTier tag = $TAG"
+
           URL="https://github.com/EasyTier/EasyTier/releases/download/${TAG}/easytier-linux-aarch64-${TAG}.zip"
           echo "URL=$URL"
           curl -fL --retry 3 -o pkgs/easytier.zip "$URL"
           unzip -o -j pkgs/easytier.zip -d pkgs/et
           ls -l pkgs/et
           [ -f pkgs/et/easytier-core ] || { echo "ERROR: zip 里没有 easytier-core"; exit 1; }
+          echo "EASYTIER_TAG=$TAG" >> "$GITHUB_ENV"
 
       # 关键：OpenWrt 用的是 musl。官方 release 里同样有 -musl 变体，
       # 而默认的 sing-box-<ver>-linux-arm64.tar.gz 是 glibc 动态链接
       # （interpreter = /lib/ld-linux-aarch64.so.1），刷进固件后必然「无法执行」。
-      # 所以这里固定取 -musl 包，稍后由 FILES 覆盖源包里那份旧二进制。
+      # 所以这里固定取 -musl 包，稍后由 FILES 覆盖源包里那份二进制。
       - name: Fetch sing-box (linux-arm64-musl)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p pkgs
-          TAG="${{ inputs.singbox_version }}"
+          TAG="${SB_TAG_INPUT:-}"
           if [ -z "$TAG" ]; then
             TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                   https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-                 | jq -r '.tag_name')
+                   https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
           fi
-          [ -n "$TAG" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
           VER=${TAG#v}
           echo "sing-box tag = $TAG (ver = $VER)"
           # 用 sort -V 做版本比较，避免 1.9 / 2.0 之类被数字大小误判
@@ -178,6 +263,7 @@ jobs:
           [ -n "$BIN" ] || BIN=$(find pkgs -type f -name sing-box | head -1)
           [ -n "$BIN" ] || { echo "ERROR: 解压后没找到 sing-box 二进制"; find pkgs -maxdepth 3; exit 1; }
           install -m 0755 "$BIN" pkgs/sing-box-bin
+
           echo "=== 二进制信息 ==="
           file pkgs/sing-box-bin
           case "$(file -b pkgs/sing-box-bin)" in
@@ -197,9 +283,12 @@ jobs:
             echo "静态链接（无 interpreter），OK"
           fi
           ls -lh pkgs/sing-box-bin
+          echo "SINGBOX_TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Build FILES overlay (easytier + luci + i18n)
         run: |
+          set -euo pipefail
+          rm -rf files
           git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
 
           mkdir -p files/usr/bin
@@ -223,7 +312,7 @@ jobs:
 
           # 中文翻译：po2lmo 必须走上游 Makefile（依赖 lib/lmo.c 与 lemon 生成的 plural_formula.c，
           # 单独 gcc po2lmo.c 会报 undefined reference to sfh_hash）
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/immortalwrt/luci.git luci-src
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/openwrt/luci.git luci-src
           git -C luci-src sparse-checkout set modules/luci-base/src
           make -C luci-src/modules/luci-base/src po2lmo
           [ -x luci-src/modules/luci-base/src/po2lmo ] || { echo "ERROR: po2lmo 构建失败"; exit 1; }
@@ -235,16 +324,17 @@ jobs:
           [ -s files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo ] || { echo "ERROR: easytier 中文 lmo 生成失败"; exit 1; }
           ls -l files/usr/lib/lua/luci/i18n/
 
-          # 局域网地址改成 192.168.12.1（uci-defaults 在 network 服务启动前执行，直接生效）
+          # 局域网地址（uci-defaults 在 network 服务启动前执行，直接生效）
           mkdir -p files/etc/uci-defaults
           printf '%s\n' \
             '#!/bin/sh' \
-            "uci -q set network.lan.ipaddr='192.168.12.1'" \
+            "uci -q set network.lan.ipaddr='${LAN_IP}'" \
             "uci -q set network.lan.netmask='255.255.255.0'" \
             'uci -q commit network' \
             'exit 0' \
             > files/etc/uci-defaults/98-n60pro-lan
           chmod 0755 files/etc/uci-defaults/98-n60pro-lan
+          echo "LAN IP = $LAN_IP"
 
           # 默认中文界面（用 printf 写，避免 heredoc 破坏 YAML 缩进）
           printf '%s\n' '#!/bin/sh' "uci -q set luci.main.lang='zh_cn'" 'uci -q commit luci' 'exit 0' \
@@ -254,187 +344,248 @@ jobs:
           echo "===== FILES 预览 ====="
           find files -type f | head -40
 
-      - name: Make image (baseline, 128M layout)
-        run: |
-          cd "$IB_DIR"
-          PACKAGES="$PKGS_BASE $PKGS_PPPOE $PKGS_IPV6"
-          echo "PACKAGES=$PACKAGES"
-          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
-          echo "===== 产物 ====="
-          ls -lh bin/targets/mediatek/filogic/
-
       # 不再手工拆 FIT：直接把改好的 dtb 放进 build_dir，让 ImageBuilder 自己重打镜像，
       # hash / load 地址 / 压缩方式 / metadata 全部由官方规则处理（dumpimage 在该版本无法提取子镜像）
-      - name: Repack two itb (patch dtb + make image)
+      # 第一次 make image 只为拿到 build_dir 里的 dtb 与 rootfs，128M 的原镜像直接丢弃。
+      - name: Build 506M image (patch dtb + make image)
         run: |
+          set -euo pipefail
           cd "$IB_DIR"
           PACKAGES="$PKGS_BASE $PKGS_PPPOE $PKGS_IPV6"
           echo "PACKAGES=$PACKAGES"
+
+          echo "=== 第 1 次 make image：生成 build_dir 里的 dtb ==="
+          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
+
           DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
-          if [ -z "$DTB" ]; then
-            echo "build_dir 里没有 dtb，先跑一次 make image 生成"
-            make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
-            DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
-          fi
           [ -n "$DTB" ] || { echo "ERROR: build_dir 里找不到 dtb"; find build_dir -name "*.dtb" | head; exit 1; }
           echo "dtb = $DTB"
+
           cp -f "$DTB" dtb.orig
           dtc -I dtb -O dts dtb.orig -o dtb.orig.dts
-          grep -A3 'label = "ubi"' dtb.orig.dts
+          echo "--- 原始 ubi 分区（仅参考）---"
+          grep -A3 'label = "ubi"' dtb.orig.dts || true
 
-          for PAIR in "506m 0x0580000 0x1fa80000" "490m 0x0580000 0x1ea00000"; do
-            set -- $PAIR
-            NAME="$1"
-            OFF="$2"
-            SIZE="$3"
-            # 按 ubi 分区起始地址 0x580000 定位那一行 reg 直接替换：
-            # 不用 awk 数组（CI 的 mawk 上未能生效），不用 \+（BSD sed 不认），也不依赖 label/reg 的先后顺序
-            sed -E "s/reg = <0x0*580000 0x[0-9a-fA-F]+>;/reg = <${OFF} ${SIZE}>;/" dtb.orig.dts > "patched-$NAME.dts"
-            grep -A3 'label = "ubi"' "patched-$NAME.dts"
-            if cmp -s dtb.orig.dts "patched-$NAME.dts"; then
-              echo "ERROR: 没替换到 ubi 的 reg（dts 里找不到 0x580000 起始的分区行）"
-              grep -A3 'label = "ubi"' dtb.orig.dts
-              exit 1
-            fi
-            dtc -q -I dts -O dtb -o "dtb-$NAME.dtb" "patched-$NAME.dts"
-            echo "--- dtb-$NAME.dtb ---"
-            dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"'
+          set -- $UBI_506M
+          OFF="$1"
+          SIZE="$2"
 
-            # 断言：dtc 反编译会把前导 0 去掉（0x0580000 -> 0x580000），所以必须按数值比较
-            REG=$(dtc -I dtb -O dts "dtb-$NAME.dtb" | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
-            echo "ubi reg = <$REG>"
-            set -- $REG
-            [ $# -ge 2 ] || { echo "ERROR: 解析 dtb 里的 ubi reg 失败"; exit 1; }
-            [ "$(( $1 ))" -eq "$(( OFF ))" ] && [ "$(( $2 ))" -eq "$(( SIZE ))" ] \
-              || { echo "ERROR: dtb-$NAME 分区不对，期望 <$OFF $SIZE> 实际 <$REG>"; exit 1; }
+          # 按 ubi 分区起始地址 0x580000 定位那一行 reg 直接替换：
+          # 不用 awk 数组（CI 的 mawk 上未能生效），不用 \+（BSD sed 不认），也不依赖 label/reg 的先后顺序
+          sed -E "s/reg = <0x0*580000 0x[0-9a-fA-F]+>;/reg = <${OFF} ${SIZE}>;/" dtb.orig.dts > patched.dts
+          if cmp -s dtb.orig.dts patched.dts; then
+            echo "ERROR: 没替换到 ubi 的 reg（dts 里找不到 0x580000 起始的分区行）"
+            grep -A3 'label = "ubi"' dtb.orig.dts || true
+            exit 1
+          fi
+          dtc -q -I dts -O dtb -o dtb-506m.dtb patched.dts
+          echo "--- dtb-506m.dtb ---"
+          dtc -I dtb -O dts dtb-506m.dtb | grep -A3 'label = "ubi"' || true
 
-            cp -f "dtb-$NAME.dtb" "$DTB"
-            rm -f bin/targets/mediatek/filogic/*sysupgrade.itb
-            make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
-            NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1)
-            [ -n "$NEW" ] || { echo "ERROR: 没有产出 sysupgrade.itb"; ls -l bin/targets/mediatek/filogic; exit 1; }
-            cp -f "$NEW" "itb-$NAME.itb"
-            ls -lh "itb-$NAME.itb"
+          # 断言：dtc 反编译会把前导 0 去掉（0x0580000 -> 0x580000），所以必须按数值比较
+          REG=$(dtc -I dtb -O dts dtb-506m.dtb | grep -A3 'label = "ubi"' | sed -n 's/.*reg = <\([^>]*\)>;.*/\1/p' | head -1)
+          echo "ubi reg = <$REG>"
+          set -- $REG
+          [ $# -ge 2 ] || { echo "ERROR: 解析 dtb 里的 ubi reg 失败"; exit 1; }
+          [ "$(( $1 ))" -eq "$(( OFF ))" ] && [ "$(( $2 ))" -eq "$(( SIZE ))" ] \
+            || { echo "ERROR: dtb 分区不对，期望 <$OFF $SIZE> 实际 <$REG>"; exit 1; }
 
-            # 校验 rootfs：ImageBuilder 的 TARGET_DIR 在 make image 后仍保留
-            TARGET=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
-            if [ -z "$TARGET" ]; then
-              echo "WARNING: 找不到 TARGET_DIR，跳过 rootfs 校验"
-            else
-              # 1) sing-box 必须是官方 musl 二进制（FILES 覆盖生效）
-              [ -f "$TARGET/usr/bin/sing-box" ] || { echo "ERROR: rootfs 里没有 /usr/bin/sing-box"; exit 1; }
-              IN_SHA=$(sha256sum "$TARGET/usr/bin/sing-box" | cut -d' ' -f1)
-              WANT_SHA=$(sha256sum "$GITHUB_WORKSPACE/pkgs/sing-box-bin" | cut -d' ' -f1)
-              echo "rootfs sing-box sha256 = $IN_SHA"
-              [ "$IN_SHA" = "$WANT_SHA" ] \
-                || { echo "ERROR: rootfs 里的 sing-box 不是官方 musl 二进制（FILES 覆盖没生效）"; exit 1; }
-              # 2) easytier 必须是 noweb 形态：不应该有 easytier-web
-              if [ -e "$TARGET/usr/bin/easytier-web" ]; then
-                echo "ERROR: 固件里出现了 easytier-web，应为 noweb 形态"
-                exit 1
-              fi
-              # 3) LuCI / PPPoE / IPv6 关键件在位
-              #    注意：rpcd 在 OpenWrt 里装到 /sbin/rpcd（不是 /usr/sbin/rpcd），两个路径都认
-              RPCD=""
-              for C in /sbin/rpcd /usr/sbin/rpcd; do
-                if [ -x "$TARGET$C" ]; then RPCD="$C"; break; fi
-              done
-              [ -n "$RPCD" ] || { echo "ERROR: rootfs 里没有 rpcd（/sbin 或 /usr/sbin）"; exit 1; }
-              echo "  OK  $RPCD"
+          echo "=== 第 2 次 make image：用改好的 dtb 重打 FIT ==="
+          cp -f dtb-506m.dtb "$DTB"
+          rm -f bin/targets/mediatek/filogic/*sysupgrade.itb
+          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
 
-              for F in /usr/sbin/uhttpd \
-                       /www/luci-static/bootstrap/cascade.css \
-                       /usr/lib/lua/luci/controller/easytier.lua \
-                       /usr/lib/lua/luci/i18n/easytier.zh-cn.lmo \
-                       /usr/sbin/pppd /usr/sbin/odhcp6c /usr/sbin/odhcpd; do
-                [ -e "$TARGET$F" ] || { echo "ERROR: rootfs 缺少 $F"; exit 1; }
-                echo "  OK  $F"
-              done
+          NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1)
+          [ -n "$NEW" ] || { echo "ERROR: 没有产出 sysupgrade.itb"; ls -l bin/targets/mediatek/filogic; exit 1; }
+          cp -f "$NEW" itb-506m.itb
+          ls -lh itb-506m.itb
 
-              # PPPoE 插件路径带 pppd 版本号，文件名是 pppoe.so
-              # （rp-pppoe.so 是 Debian/Ubuntu 的叫法，OpenWrt 的 ppp-mod-pppoe 装的是 pppoe.so）
-              PPPOE_SO=$(ls "$TARGET"/usr/lib/pppd/*/pppoe.so 2>/dev/null | head -1)
-              if [ -z "$PPPOE_SO" ]; then
-                echo "ERROR: 缺少 pppd 的 pppoe.so 插件，PPPoE 拨号不可用"
-                ls -R "$TARGET/usr/lib/pppd" 2>/dev/null | head -20
-                exit 1
-              fi
-              echo "  OK  ${PPPOE_SO#$TARGET}"
-            fi
-          done
-
-      - name: Verify itb
+      - name: Verify rootfs & itb
         run: |
+          set -euo pipefail
           cd "$IB_DIR"
-          for S in 506m 490m; do
-            echo "======== itb-$S.itb ========"
-            dumpimage -l "itb-$S.itb" | tee "fit-$S.txt"
-            grep -q "Flat Device Tree" "fit-$S.txt" || { echo "ERROR: 缺少 dtb"; exit 1; }
-            grep -q "Filesystem" "fit-$S.txt" || { echo "ERROR: 缺少 rootfs"; exit 1; }
-            FDT_SHA=$(awk '/Image [0-9]+ \(/{img=$0} /Hash value:/{if (img ~ /fdt-1/ && prev ~ /sha1/) {print $3; exit}} {prev=$0}' "fit-$S.txt")
-            LOCAL_SHA=$(sha1sum "dtb-$S.dtb" | cut -d' ' -f1)
-            echo "fdt sha1 in itb = $FDT_SHA"
-            echo "local dtb sha1  = $LOCAL_SHA"
-            [ -n "$FDT_SHA" ] && [ "$FDT_SHA" = "$LOCAL_SHA" ] || { echo "ERROR: itb 里的 dtb 不是我们改的那份"; exit 1; }
+
+          # ---------- rootfs 校验：ImageBuilder 的 TARGET_DIR 在 make image 后仍保留 ----------
+          TARGET=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
+          [ -n "$TARGET" ] || { echo "ERROR: 找不到 TARGET_DIR，无法校验 rootfs"; exit 1; }
+
+          # 1) sing-box 必须是官方 musl 二进制（FILES 覆盖生效）
+          [ -f "$TARGET/usr/bin/sing-box" ] || { echo "ERROR: rootfs 里没有 /usr/bin/sing-box"; exit 1; }
+          IN_SHA=$(sha256sum "$TARGET/usr/bin/sing-box" | cut -d' ' -f1)
+          WANT_SHA=$(sha256sum "$GITHUB_WORKSPACE/pkgs/sing-box-bin" | cut -d' ' -f1)
+          echo "rootfs sing-box sha256 = $IN_SHA"
+          [ "$IN_SHA" = "$WANT_SHA" ] \
+            || { echo "ERROR: rootfs 里的 sing-box 不是官方 musl 二进制（FILES 覆盖没生效）"; exit 1; }
+
+          # 2) easytier 必须是 noweb 形态：不应该有 easytier-web
+          if [ -e "$TARGET/usr/bin/easytier-web" ] || [ -e "$TARGET/usr/bin/easytier-web-embed" ]; then
+            echo "ERROR: 固件里出现了 easytier-web，应为 noweb 形态"
+            exit 1
+          fi
+
+          # 3) LuCI / PPPoE / IPv6 关键件在位
+          #    注意：rpcd 在 OpenWrt 里装到 /sbin/rpcd（不是 /usr/sbin/rpcd），两个路径都认
+          RPCD=""
+          for C in /sbin/rpcd /usr/sbin/rpcd; do
+            if [ -x "$TARGET$C" ]; then RPCD="$C"; break; fi
           done
-          H506=$(sha256sum itb-506m.itb | cut -d' ' -f1)
-          H490=$(sha256sum itb-490m.itb | cut -d' ' -f1)
-          [ "$H506" != "$H490" ] || { echo "ERROR: 两个 itb 完全相同"; exit 1; }
-          echo "506M: $H506"
-          echo "490M: $H490"
+          [ -n "$RPCD" ] || { echo "ERROR: rootfs 里没有 rpcd（/sbin 或 /usr/sbin）"; exit 1; }
+          echo "  OK  $RPCD"
+
+          for F in /usr/sbin/uhttpd \
+                   /www/luci-static/bootstrap/cascade.css \
+                   /usr/lib/lua/luci/controller/easytier.lua \
+                   /usr/lib/lua/luci/i18n/easytier.zh-cn.lmo \
+                   /etc/init.d/momo \
+                   /usr/sbin/pppd /usr/sbin/odhcp6c /usr/sbin/odhcpd; do
+            [ -e "$TARGET$F" ] || { echo "ERROR: rootfs 缺少 $F"; exit 1; }
+            echo "  OK  $F"
+          done
+
+          # PPPoE 插件路径带 pppd 版本号，文件名是 pppoe.so
+          # （rp-pppoe.so 是 Debian/Ubuntu 的叫法，OpenWrt 的 ppp-mod-pppoe 装的是 pppoe.so）
+          PPPOE_SO=$(ls "$TARGET"/usr/lib/pppd/*/pppoe.so 2>/dev/null | head -1)
+          if [ -z "$PPPOE_SO" ]; then
+            echo "ERROR: 缺少 pppd 的 pppoe.so 插件，PPPoE 拨号不可用"
+            ls -R "$TARGET/usr/lib/pppd" 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "  OK  ${PPPOE_SO#$TARGET}"
+
+          # 3b) PPPoE / IPv6 的包与内核模块必须在位（避免模板改动后静默丢包）
+          #     优先读 apk 数据库，老版本回退 opkg status；读不到就只告警不误杀
+          APKDB="$TARGET/lib/apk/db/installed"
+          OPKGDB="$TARGET/usr/lib/opkg/status"
+          need_pkg() {
+            if [ -f "$APKDB" ]; then
+              grep -qx "P:$1" "$APKDB" || { echo "ERROR: rootfs 里没有包 $1"; exit 1; }
+            elif [ -f "$OPKGDB" ]; then
+              grep -qx "Package: $1" "$OPKGDB" || { echo "ERROR: rootfs 里没有包 $1"; exit 1; }
+            else
+              echo "  WARN 读不到包数据库，跳过 pkg:$1"
+              return 0
+            fi
+            echo "  OK  pkg:$1"
+          }
+
+          for P in ppp ppp-mod-pppoe kmod-ppp kmod-pppox kmod-pppoe luci-proto-ppp \
+                   odhcp6c odhcpd-ipv6only luci-proto-ipv6; do
+            need_pkg "$P"
+          done
+
+          # 内核模块（kmod 包装了，.ko 也必须在；pppoe 依赖 pppox，pppox 依赖 ppp_generic）
+          for M in ppp_generic.ko pppox.ko pppoe.ko; do
+            KO=$(find "$TARGET/lib/modules" -name "${M}*" | head -1)
+            [ -n "$KO" ] || { echo "ERROR: 缺少内核模块 $M（PPPoE 拨号会失败）"; exit 1; }
+            echo "  OK  ${KO#$TARGET}"
+          done
+
+          # LuCI 的协议处理器：新版是 JS（/www/luci-static/resources/protocol），
+          # 老版/兼容层是 Lua（/usr/lib/lua/luci/model/network），两种都认
+          check_any() {
+            DESC="$1"; shift
+            for p in "$@"; do
+              if [ -e "$TARGET$p" ]; then echo "  OK  $DESC -> $p"; return 0; fi
+            done
+            echo "ERROR: 缺少 $DESC（LuCI 里选不到该协议）"
+            exit 1
+          }
+          check_any "LuCI PPPoE 协议" \
+            /www/luci-static/resources/protocol/pppoe.js \
+            /usr/lib/lua/luci/model/network/proto_pppoe.lua
+          check_any "LuCI DHCPv6 协议" \
+            /www/luci-static/resources/protocol/dhcpv6.js \
+            /usr/lib/lua/luci/model/network/proto_dhcpv6.lua
+
+          # IPv6 默认放行到 LAN：RA / DHCPv6 服务端（base-files 默认配置，只做告警）
+          if grep -Eq "option (ra|dhcpv6) '(server|hybrid)'" "$TARGET/etc/config/dhcp" 2>/dev/null; then
+            echo "  OK  /etc/config/dhcp 默认开启 RA / DHCPv6"
+            grep -E "option (ra|dhcpv6) " "$TARGET/etc/config/dhcp" | head -4 || true
+          else
+            echo "  WARN /etc/config/dhcp 里没看到 ra/dhcpv6=server，LAN 侧 IPv6 可能要在 LuCI 里手工开"
+          fi
+
+          # WAN6 接口（PPPoE 下由 @wan 派生，负责 DHCPv6-PD 拿前缀）
+          if grep -q "config interface 'wan6'" "$TARGET/etc/config/network" 2>/dev/null; then
+            echo "  OK  /etc/config/network 里有 wan6"
+          else
+            echo "  WARN /etc/config/network 里没有 wan6（PPPoE 下需要手工加个 DHCPv6 客户端接口）"
+          fi
+
+          # 4) 确认 uci-defaults 里的 LAN IP 就是目标值（防止模板变量没展开）
+          LAN_DEFAULT=$(sed -n "s/.*network.lan.ipaddr='\([^']*\)'.*/\1/p" "$TARGET/etc/uci-defaults/98-n60pro-lan" | head -1)
+          echo "rootfs 默认 LAN IP = ${LAN_DEFAULT:-<空>}"
+          [ "$LAN_DEFAULT" = "$LAN_IP" ] || { echo "ERROR: rootfs 里的 LAN IP 与期望的 $LAN_IP 不一致"; exit 1; }
+
+          # ---------- FIT 校验 ----------
+          dumpimage -l itb-506m.itb | tee fit-506m.txt
+          grep -q "Flat Device Tree" fit-506m.txt || { echo "ERROR: 缺少 dtb"; exit 1; }
+          grep -q "Filesystem" fit-506m.txt || { echo "ERROR: 缺少 rootfs"; exit 1; }
+
+          FDT_SHA=$(awk '/Image [0-9]+ \(/{img=$0} /Hash value:/{if (img ~ /fdt-1/ && prev ~ /sha1/) {print $3; exit}} {prev=$0}' fit-506m.txt)
+          LOCAL_SHA=$(sha1sum dtb-506m.dtb | cut -d' ' -f1)
+          echo "fdt sha1 in itb = $FDT_SHA"
+          echo "local dtb sha1  = $LOCAL_SHA"
+          [ -n "$FDT_SHA" ] && [ "$FDT_SHA" = "$LOCAL_SHA" ] || { echo "ERROR: itb 里的 dtb 不是我们改的那份"; exit 1; }
+
+          sha256sum itb-506m.itb | tee itb-506m.sha256
 
       - name: Collect artifacts
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/out/506m" "$GITHUB_WORKSPACE/out/490m"
-          BASE=immortalwrt-mediatek-filogic-netcore_n60-pro-squashfs-sysupgrade
-          cp -f "$IB_DIR/itb-506m.itb" "$GITHUB_WORKSPACE/out/506m/${BASE}-506m.itb"
-          cp -f "$IB_DIR/itb-490m.itb" "$GITHUB_WORKSPACE/out/490m/${BASE}-490m.itb"
-          ( cd "$GITHUB_WORKSPACE/out/506m" && sha256sum * > sha256sums.txt )
-          ( cd "$GITHUB_WORKSPACE/out/490m" && sha256sum * > sha256sums.txt )
-          ls -lR "$GITHUB_WORKSPACE/out"
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          # 官方命名随版本变化（release 带版本前缀，snapshot 不带），所以用 glob 取，
+          # 再统一插一个 -506m 后缀，产物名保持稳定
+          SRC=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb | head -1)
+          NAME=$(basename "$SRC" | sed 's/-squashfs-sysupgrade\.itb$/-506m-squashfs-sysupgrade.itb/')
+          cp -f "$IB_DIR/itb-506m.itb" "$OUT/$NAME"
+
+          {
+            echo "device  : Netcore ${DEVICE_NAME} (MT7986A / 512MB SPI NAND)"
+            echo "openwrt : ${OPENWRT_DISTRIB} (${OPENWRT_BUILD})"
+            echo "ubi     : ${UBI_506M}"
+            echo "lan ip  : ${LAN_IP}"
+            echo "momo    : ${MOMO_REPO}"
+            echo "sing-box: ${SINGBOX_TAG}"
+            echo "easytier: ${EASYTIER_TAG}"
+            echo "build   : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > "$OUT/build-info.txt"
+
+          ( cd "$OUT" && sha256sum * > sha256sums.txt )
+          cat "$OUT/build-info.txt"
+          ls -lh "$OUT"
 
       - name: Upload Firmware To Release (506M)
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ env.TAG_506M }}
-          name: ImmortalWrt N60 Pro ImageBuilder 506.5MB
+          tag: ${{ env.TAG }}
+          name: OpenWrt N60 Pro ImageBuilder 506.5MB
           body: |
             Netcore N60 Pro / MT7986A / 512MB SPI NAND
-            ubi 分区：${{ env.UBI_506M }}
-            默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、sing-box、easytier noweb（含中文 LuCI）、UPnP（含中文 LuCI）
+            OpenWrt：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）
+            ubi 分区：${{ env.UBI_506M }}（506.5 MiB，起始 0x0580000）
+            默认地址：${{ env.LAN_IP }}
+            预装：momo（含中文 LuCI）、sing-box ${{ env.SINGBOX_TAG }}、easytier ${{ env.EASYTIER_TAG }} noweb（含中文 LuCI）、UPnP（含中文 LuCI）
             内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*、kmod-ppp/pppoe/pppox
             拨号：支持 PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp，LuCI 协议里可选）
             IPv6：默认开启（odhcp6c 拿 DHCPv6-PD，odhcpd 下发 RA/DHCPv6，luci-proto-ipv6 可配）
             界面：完整 LuCI（luci-base + luci-mod-network/system/status + bootstrap 主题 + uhttpd + rpcd），默认中文
-            sing-box：包来自源（提供 init/config），二进制替换为官方 sing-box-<ver>-linux-arm64-musl，可在 MT7986A 上直接执行
+            sing-box：包来自官方源（提供 init/config），二进制替换为官方 sing-box-<ver>-linux-arm64-musl，可在 MT7986A 上直接执行
             easytier：noweb 形态，仅 easytier-core + easytier-cli，不含 easytier-web/easytier-web-embed
+            momo：来自 momomomo.pages.dev 的 ${{ env.MOMO_BRANCH }} 分支，LuCI「服务 → Momo」里配置
             Shell：预装 bash（默认 shell 仍为 busybox ash，需要时 `bash` 进入）
-            刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
-          artifacts: out/506m/*
-          allowUpdates: true
-          removeArtifacts: true
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Firmware To Release (490M)
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ env.TAG_490M }}
-          name: ImmortalWrt N60 Pro ImageBuilder 490MB
-          body: |
-            Netcore N60 Pro / MT7986A / 512MB SPI NAND
-            ubi 分区：${{ env.UBI_490M }}
-            默认地址：192.168.12.1
-            预装：momo（含中文 LuCI）、sing-box、easytier noweb（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-*、kmod-ppp/pppoe/pppox
-            拨号：支持 PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp，LuCI 协议里可选）
-            IPv6：默认开启（odhcp6c 拿 DHCPv6-PD，odhcpd 下发 RA/DHCPv6，luci-proto-ipv6 可配）
-            界面：完整 LuCI（luci-base + luci-mod-network/system/status + bootstrap 主题 + uhttpd + rpcd），默认中文
-            sing-box：包来自源（提供 init/config），二进制替换为官方 sing-box-<ver>-linux-arm64-musl，可在 MT7986A 上直接执行
-            easytier：noweb 形态，仅 easytier-core + easytier-cli，不含 easytier-web/easytier-web-embed
-            Shell：预装 bash（默认 shell 仍为 busybox ash，需要时 `bash` 进入）
-            刷机：同分区间可直接 sysupgrade；跨分区必须用目标分区表的内核（recovery）引导后刷，且不要保留配置
-          artifacts: out/490m/*
+            刷机：
+            - 已经是 506M 分区：直接 sysupgrade（可保留配置）
+            - 从 128M 原厂分区跨过来：必须先用目标分区表的内核（recovery）引导再刷，且不要保留配置
+            - momo / TUN / easytier 都是用户态处理，建议关掉 packet steering 与 flow offloading
+
+            说明：本固件基于 OpenWrt ${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）。
+            snapshot 是滚动版本，内核与 kmod ABI 会变，kmod 必须与镜像来自同一次构建；
+            升级请整包 sysupgrade，不要往 snapshot 机器上装正式版 kmod（反之亦然）。
+          artifacts: out/*
           allowUpdates: true
           removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
