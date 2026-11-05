@@ -1,7 +1,9 @@
 name: jdcloud-taiyi-imagebuilder
 
 # 京东云 太乙 RE-CS-07（JDCloud Taiyi / IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi）
-# 基于 OpenWrt 官方 snapshot ImageBuilder（该机型只在 snapshot 里，25.12.x 正式版没有）
+# 基于 ImmortalWrt snapshot ImageBuilder（默认源；该机型在官方 25.12.x 正式版里没有）
+# 构建源可切：source=immortalwrt（默认）/ openwrt（官方 snapshot，feed 修复后可切回去）。
+#   之前用官方 snapshot 出过 procd 已更新、配套 libubox 没发出来的半同步问题，故默认走 ImmortalWrt。
 #
 # snapshot 默认什么都不带，所以这里补：
 #   1) LuCI 全家桶 + 中文（luci-i18n-base-zh-cn + uci-defaults 设 zh_cn），否则刷完没有 web 界面
@@ -36,9 +38,13 @@ on:
         required: false
         default: '192.168.22.1'
       extra_packages:
-        description: '额外 apk 包（空格分隔，不存在的会自动丢弃）'
+        description: '额外 apk 包（空格分隔）'
         required: false
         default: ''
+      source:
+        description: '构建源：immortalwrt（默认，feed 自洽）/ openwrt（官方 snapshot 修好后可切）'
+        required: false
+        default: 'immortalwrt'
   # 点 star 触发（只在默认分支生效）
   watch:
     types: [started]
@@ -54,8 +60,9 @@ permissions:
   contents: write
 
 env:
-  IB_URL: https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/openwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
-  VER_URL: https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/version.buildinfo
+  # 上游源：默认 ImmortalWrt snapshot（feed 自洽、有本机型）；
+  # 官方 OpenWrt snapshot 修好后可把 source 填 openwrt 切回去
+  IB_SRC: ${{ github.event.inputs.source || 'immortalwrt' }}
   PROFILE: jdcloud_re-cs-07
   PKG_ARCH: aarch64_cortex-a53
   DEVICE_NAME: jdcloud-re-cs-07
@@ -95,13 +102,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          case "$IB_SRC" in
+            immortalwrt|ImmortalWrt|IWRT)
+              BASE_URL=https://downloads.immortalwrt.org/snapshots
+              IB_FILE=immortalwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
+              DISTRIB=IMMORTALWRT-SNAPSHOT
+              ;;
+            *)
+              BASE_URL=https://downloads.openwrt.org/snapshots
+              IB_FILE=openwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
+              DISTRIB=SNAPSHOT
+              ;;
+          esac
+          IB_URL="${BASE_URL}/targets/qualcommax/ipq60xx/${IB_FILE}"
+          echo "source = $DISTRIB"
+          echo "IB_URL = $IB_URL"
+
           curl -fL --retry 3 --retry-delay 5 -o ib.tar.zst "$IB_URL"
           tar --zstd -xf ib.tar.zst
-          IB=$(ls -d "$PWD"/openwrt-imagebuilder-* | head -1)
+          IB=$(ls -d "$PWD"/*imagebuilder-* | head -1)
           [ -d "$IB" ] || { echo "ERROR: 解压后没找到 ImageBuilder 目录"; ls -al; exit 1; }
           echo "IB_DIR=$IB" >> "$GITHUB_ENV"
-          echo "OPENWRT_VER=$(curl -fsSL --retry 3 "$VER_URL" | head -1 | tr -d '\r\n' || echo unknown)" >> "$GITHUB_ENV"
-          echo "ImageBuilder = $IB"
+          BUILDINFO=$(curl -fsSL --retry 3 "${BASE_URL}/targets/qualcommax/ipq60xx/version.buildinfo" | head -1 | tr -d '\r\n' || true)
+          echo "OPENWRT_VER=${DISTRIB}(${BUILDINFO:-unknown})" >> "$GITHUB_ENV"
+          echo "ImageBuilder = $IB ($DISTRIB build ${BUILDINFO:-unknown})"
 
           cd "$IB"
           # ImageBuilder 默认不产 initramfs 镜像（tarball 里的 .config 没开 INITRAMFS），
@@ -200,65 +224,35 @@ jobs:
           echo "LAN IP = $LAN_IP, easytier = $ET"
           find files -type f | head -20
 
-      # snapshot 的源是滚动的，失败要分两类处理：
-      #   1) 我们点名的包不存在（包名变了）        -> 从列表里剔掉重试
-      #   2) 缺的包不在我们列表里（上游依赖断裂）  -> buildbot 正在重建 feed，等几分钟重试（不能靠剔包）
+      # 只跑一次，不重试：失败就把原因和人话建议打出来
       - name: Make image
         run: |
-          set -uo pipefail
+          set -euo pipefail
           cd "$IB_DIR"
-          printf '%s\n' $PKGS ${EXTRA_PKGS:-} | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u > pkgs.txt
+          PACKAGES="$(printf '%s %s' "$PKGS" "${EXTRA_PKGS:-}")"
+          echo "PACKAGES=$PACKAGES"
 
           # meow 的包未签名，给 apk add 补 --allow-untrusted（IB 若已带，这一步是 no-op）
           sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
           grep -q "allow-untrusted" Makefile || echo "WARNING: 没匹配到 apk add，靠 packages.adb 索引"
 
-          prune=0
-          feed_retry=0
-          while :; do
-            ALL=$(tr '\n' ' ' < pkgs.txt)
-            echo "=== make image（$(wc -l < pkgs.txt) 个包；已剔除 $prune 次 / 已等上游 $feed_retry 次）==="
-            if make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$ALL" > build.log 2>&1; then
-              echo "=== BUILD OK ==="
-              break
-            fi
-            tail -30 build.log
-
-            # opkg: Unknown package 'foo' / apk: foo (no such package)
+          if make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES" > build.log 2>&1; then
+            echo "=== BUILD OK ==="
+          else
+            tail -40 build.log
+            echo "---------- 失败原因（包名缺失）----------"
             { grep -oE "Unknown package '[^']+'" build.log | sed -E "s/.*'(.*)'/\1/" || true
               grep -oE "[A-Za-z0-9._+-]+ \(no such package\)" build.log | sed 's/ (no such package)//' || true
-            } | sort -u > missing.txt
-            [ -s missing.txt ] || { echo "ERROR: 构建失败，日志里没有可识别的包名"; exit 1; }
+            } | sort -u | sed 's/^/  缺: /'
+            echo "----------------------------------------"
+            echo "如果缺的是 libubox20xxxxxx / libblobmsg-json20xxxxxx 这类库，说明上游 feed 正在重建"
+            echo "（procd 已更新但配套的 libubox 还没发出来），跟本文件的包列表无关。可选："
+            echo "  1) 把 source 填回 immortalwrt（默认值，feed 自洽、有本机型）"
+            echo "  2) 如果已经在 immortalwrt 上失败，过几小时重跑（上游重建）"
+            exit 1
+          fi
 
-            # 只保留「我们自己点名、且源里确实没有」的包；依赖链断裂剔包没用
-            grep -xF -f pkgs.txt missing.txt > ours.txt || true
-
-            if [ -s ours.txt ]; then
-              prune=$((prune + 1))
-              [ "$prune" -le 2 ] || { echo "ERROR: 剔除 2 次仍然失败"; exit 1; }
-              echo "--- 源里没有这些包，丢弃后重试：$(tr '\n' ' ' < ours.txt)"
-              grep -vxF -f ours.txt pkgs.txt > pkgs.new || true
-              [ -s pkgs.new ] || { echo "ERROR: 包列表被清空"; exit 1; }
-              mv pkgs.new pkgs.txt
-              continue
-            fi
-
-            # 缺的包不是我们请求的 => snapshot 的 feed 与镜像不同步（buildbot 正在重建）
-            feed_retry=$((feed_retry + 1))
-            echo "!!! 上游依赖断裂（这些包不在我们的请求列表里）：$(tr '\n' ' ' < missing.txt)"
-            echo "!!! 典型原因：OpenWrt snapshot 正在重建，base 源里 procd/mtd 已更新但配套的 libubox 还没发出来"
-            if [ "$feed_retry" -gt 4 ]; then
-              echo "ERROR: 已等 4 轮（约 16 分钟），snapshot 仍然不同步。"
-              echo "       过几小时重跑即可（太乙只在 snapshot 里，没有正式版可退）；"
-              echo "       也可以看 https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/ 的构建时间"
-              exit 1
-            fi
-            echo "!!! 清掉 dl 缓存后等待 240s 再试（$feed_retry/4）"
-            rm -rf dl
-            sleep 240
-          done
-
-          echo "PKGS_FINAL=$(tr '\n' ' ' < pkgs.txt)" >> "$GITHUB_ENV"
+          echo "PKGS_FINAL=$PACKAGES" >> "$GITHUB_ENV"
           ls -lh bin/targets/qualcommax/ipq60xx/
 
       # 校验 rootfs 里该有的东西都在，然后把产物收进 out/
@@ -266,19 +260,21 @@ jobs:
         run: |
           set -euo pipefail
           cd "$IB_DIR"
-          BASE=openwrt-qualcommax-ipq60xx-${PROFILE}
           IMG=bin/targets/qualcommax/ipq60xx
           T=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
           [ -n "$T" ] || { echo "ERROR: 找不到 TARGET_DIR"; exit 1; }
 
-          # sysupgrade 必须有；initramfs 只告警（没开 INITRAMFS 时确实不产）
-          [ -s "$IMG/${BASE}-squashfs-sysupgrade.bin" ] \
-            || { echo "ERROR: 没有产出 squashfs-sysupgrade.bin"; ls -lh "$IMG"; exit 1; }
-          echo "  OK   $(basename "$IMG/${BASE}-squashfs-sysupgrade.bin") ($(du -h "$IMG/${BASE}-squashfs-sysupgrade.bin" | cut -f1))"
-          if [ -s "$IMG/${BASE}-initramfs-uImage.itb" ]; then
-            echo "  OK   $(basename "$IMG/${BASE}-initramfs-uImage.itb")"
+          # 产物前缀随源变化（openwrt- / immortalwrt-），一律用 glob 取
+          SYS=$(ls "$IMG"/*squashfs-sysupgrade.bin 2>/dev/null | head -1)
+          [ -n "$SYS" ] || { echo "ERROR: 没有产出 squashfs-sysupgrade.bin"; ls -lh "$IMG"; exit 1; }
+          echo "  OK   $(basename "$SYS") ($(du -h "$SYS" | cut -f1))"
+
+          # initramfs 只告警（没开 INITRAMFS 时确实不产）
+          INIT=$(ls "$IMG"/*initramfs-uImage.itb 2>/dev/null | head -1)
+          if [ -n "$INIT" ]; then
+            echo "  OK   $(basename "$INIT")"
           else
-            echo "  WARN 没有 initramfs 镜像，首次刷机请用官方 downloads 里的 initramfs 引导"
+            echo "  WARN 没有 initramfs 镜像，首次刷机请用同一 snapshot 的 initramfs 引导"
           fi
 
           fail=0
@@ -349,10 +345,8 @@ jobs:
 
           # ---------- 收集产物 ----------
           OUT="$GITHUB_WORKSPACE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
-          cp -f "$IMG/${BASE}-squashfs-sysupgrade.bin" "$OUT/"
-          if [ -s "$IMG/${BASE}-initramfs-uImage.itb" ]; then
-            cp -f "$IMG/${BASE}-initramfs-uImage.itb" "$OUT/"
-          fi
+          cp -f "$SYS" "$OUT/"
+          [ -n "$INIT" ] && cp -f "$INIT" "$OUT/" || true
           {
             echo "device  : JDCloud ${DEVICE_NAME} (${PROFILE})"
             echo "openwrt : ${OPENWRT_VER}"
@@ -368,7 +362,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.RELEASE_TAG }}
-          name: OpenWrt JDCloud Taiyi RE-CS-07 (snapshot + LuCI + meow + easytier)
+          name: JDCloud Taiyi RE-CS-07 (LuCI + meow + easytier)
           prerelease: true
           allowUpdates: true
           removeArtifacts: true
@@ -376,7 +370,7 @@ jobs:
           artifacts: out/*
           body: |
             JDCloud 太乙 RE-CS-07 / IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi
-            OpenWrt snapshot：${{ env.OPENWRT_VER }}（profile `jdcloud_re-cs-07`）
+            构建源：${{ env.OPENWRT_VER }}（profile `jdcloud_re-cs-07`）
             默认 LAN：${{ env.LAN_IP }}，主机名 Taiyi，LuCI 默认中文
 
             预装：
