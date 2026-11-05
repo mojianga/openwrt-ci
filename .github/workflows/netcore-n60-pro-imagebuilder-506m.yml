@@ -201,6 +201,28 @@ jobs:
           LUCI_FILE=$(basename "$LUCI_APK")
           curl -fL --retry 3 -o "packages/$MEOW_FILE" "$MEOW_APK"
           curl -fL --retry 3 -o "packages/$LUCI_FILE" "$LUCI_APK"
+
+          # apk 会按 <name>-<version>.apk 去找包文件（OpenWrt 官方仓库就是这个命名），
+          # 上游 release 却是 <name>_<ver>_<arch>.apk，不改名会报
+          #   ERROR: meow-0.28.0-r1: package mentioned in index not found
+          rename_apk() {  # $1=文件名 $2=架构后缀
+            f="$1"; a="$2"
+            case "$f" in
+              *_*_"${a}".apk)
+                n="${f%%_*}"
+                v="${f#*_}"
+                v="${v%_"${a}".apk}"
+                mv -f "packages/$f" "packages/${n}-${v}.apk"
+                echo "renamed: $f -> ${n}-${v}.apk"
+                ;;
+              *)
+                echo "keep: $f（已是 <name>-<version>.apk 形式）"
+                ;;
+            esac
+          }
+          rename_apk "$MEOW_FILE" "$PKG_ARCH"
+          rename_apk "$LUCI_FILE" "all"
+
           ls -lh packages/
           sha256sum packages/*.apk
 
@@ -211,7 +233,7 @@ jobs:
             || echo "WARNING: Makefile 里没匹配到 apk add，靠 packages.adb 索引（可能装不上未签名包）"
 
           echo "MEOW_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "MEOW_PKG=$MEOW_FILE" >> "$GITHUB_ENV"
+          echo "MEOW_PKG=$(ls packages/meow-*.apk 2>/dev/null | head -1 | xargs -r basename)" >> "$GITHUB_ENV"
 
       - name: Fetch EasyTier binaries
         env:
@@ -307,15 +329,17 @@ jobs:
               return 0
             fi
             tail -40 build.log
-            echo "---------- 失败原因（包名缺失）----------"
+            echo "---------- apk/opkg 报错 ----------"
+            grep -E "^(ERROR|WARNING)" build.log | head -10 || true
+            echo "---------- 缺失的包 ----------"
             { grep -oE "Unknown package '[^']+'" build.log | sed -E "s/.*'(.*)'/\1/" || true
               grep -oE "[A-Za-z0-9._+-]+ \(no such package\)" build.log | sed 's/ (no such package)//' || true
             } | sort -u | sed 's/^/  缺: /'
             echo "----------------------------------------"
-            echo "如果缺的是 libubox20xxxxxx / libblobmsg-json20xxxxxx 这类库，说明上游 feed 正在重建"
-            echo "（procd 已更新但配套 libubox 还没发出来），跟本文件的包列表无关。可选："
-            echo "  1) 把 source 填回 immortalwrt（默认值，feed 自洽）"
-            echo "  2) 如果已在 immortalwrt 上失败，过几小时重跑；或用 source=openwrt + openwrt_version=25.12.6"
+            echo "排查提示："
+            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑"
+            echo "  - 报 'package mentioned in index not found'：packages/ 里的 .apk 必须是 <name>-<version>.apk 命名"
+            echo "  - 其他：看上面 apk 报错原文"
             return 1
           }
 
