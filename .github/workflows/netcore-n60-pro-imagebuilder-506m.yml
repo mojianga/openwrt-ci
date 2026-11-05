@@ -120,26 +120,31 @@ jobs:
           set -euo pipefail
           # 正式版的 imagebuilder 文件名带版本号（openwrt-imagebuilder-<ver>-mediatek-filogic...），
           # snapshot 不带；按顺序探一遍，省得换版本时手改
-          if [ "$IB_SRC" = "immortalwrt" ] || [ "$IB_SRC" = "ImmortalWrt" ]; then
-            BASE_URL=https://downloads.immortalwrt.org/snapshots
-            DISTRIB=IMMORTALWRT-SNAPSHOT
-            CANDIDATES="immortalwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
-          else
-            case "$OPENWRT_VER" in
-              snapshot|SNAPSHOT|snapshots)
-                BASE_URL=https://downloads.openwrt.org/snapshots
-                DISTRIB=SNAPSHOT
-                ;;
-              *)
-                BASE_URL=https://downloads.openwrt.org/releases/${OPENWRT_VER}
-                DISTRIB=$OPENWRT_VER
-                ;;
-            esac
-            CANDIDATES="openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
-            if [ "$DISTRIB" != "SNAPSHOT" ]; then
-              CANDIDATES="openwrt-imagebuilder-${DISTRIB}-mediatek-filogic.Linux-x86_64.tar.zst ${CANDIDATES}"
-            fi
-          fi
+          case "$IB_SRC" in
+            immortalwrt|ImmortalWrt|IMMORTALWRT|iwrt|imm)
+              BASE_URL=https://downloads.immortalwrt.org/snapshots
+              DISTRIB=IMMORTALWRT-SNAPSHOT
+              CANDIDATES="immortalwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
+              ;;
+            openwrt|OpenWrt|OPENWRT|owrt|"")
+              case "$OPENWRT_VER" in
+                snapshot|SNAPSHOT|snapshots)
+                  BASE_URL=https://downloads.openwrt.org/snapshots
+                  DISTRIB=OPENWRT-SNAPSHOT
+                  CANDIDATES="openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
+                  ;;
+                *)
+                  BASE_URL=https://downloads.openwrt.org/releases/${OPENWRT_VER}
+                  DISTRIB=OPENWRT-${OPENWRT_VER}
+                  CANDIDATES="openwrt-imagebuilder-${OPENWRT_VER}-mediatek-filogic.Linux-x86_64.tar.zst openwrt-imagebuilder-mediatek-filogic.Linux-x86_64.tar.zst"
+                  ;;
+              esac
+              ;;
+            *)
+              echo "ERROR: source 只能是 openwrt 或 immortalwrt（当前：$IB_SRC）"
+              exit 1
+              ;;
+          esac
           IB_FILE=""
           for NAME in $CANDIDATES; do
             if curl -fsIL --retry 2 --max-time 30 "${BASE_URL}/targets/mediatek/filogic/${NAME}" > /dev/null; then
@@ -177,6 +182,13 @@ jobs:
         run: |
           set -euo pipefail
           cd "$IB_DIR"
+
+          # 本流程只支持 apk 体系（25.12+/snapshot）；opkg 时代的 ImageBuilder 要 .ipk，这里不覆盖
+          if [ ! -f repositories ] && [ -f repositories.conf ]; then
+            echo "ERROR: 这个 ImageBuilder 是 opkg 体系（只有 repositories.conf）"
+            echo "       本流程的 meow 包与索引都按 apk 处理，请把 openwrt_version 填 25.12.x 或 snapshot"
+            exit 1
+          fi
 
           TAG="${MEOW_TAG_INPUT:-}"
           if [ -z "$TAG" ]; then
@@ -384,7 +396,7 @@ jobs:
           rm -f bin/targets/mediatek/filogic/*sysupgrade.itb
           build_image
 
-          NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1)
+          NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1 || true)
           [ -n "$NEW" ] || { echo "ERROR: 没有产出 sysupgrade.itb"; ls -l bin/targets/mediatek/filogic; exit 1; }
           cp -f "$NEW" itb-506m.itb
           ls -lh itb-506m.itb
@@ -538,13 +550,14 @@ jobs:
 
           # 官方命名随版本变化（release 带版本前缀，snapshot 不带），所以用 glob 取，
           # 再统一插一个 -506m 后缀，产物名保持稳定
-          SRC=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb | head -1)
+          SRC=$(ls "$IB_DIR"/bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1 || true)
+          [ -n "$SRC" ] || { echo "ERROR: 找不到 sysupgrade.itb"; ls -lh "$IB_DIR"/bin/targets/mediatek/filogic/ 2>/dev/null; exit 1; }
           NAME=$(basename "$SRC" | sed 's/-squashfs-sysupgrade\.itb$/-506m-squashfs-sysupgrade.itb/')
           cp -f "$IB_DIR/itb-506m.itb" "$OUT/$NAME"
 
           {
             echo "device  : Netcore ${DEVICE_NAME} (MT7986A / 512MB SPI NAND)"
-            echo "openwrt : ${OPENWRT_DISTRIB} (${OPENWRT_BUILD})"
+            echo "source  : ${OPENWRT_DISTRIB} (${OPENWRT_BUILD})"
             echo "ubi     : ${UBI_506M}"
             echo "lan ip  : ${LAN_IP}"
             echo "meow    : ${MEOW_TAG}  (${MEOW_PKG})"
@@ -562,41 +575,22 @@ jobs:
           tag: ${{ env.TAG }}
           name: Netcore N60 Pro ImageBuilder 506.5MB (meow)
           body: |
-            Netcore N60 Pro / MT7986A / 512MB SPI NAND
-            构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）
-            ubi 分区：${{ env.UBI_506M }}（506.5 MiB，起始 0x0580000）
-            默认地址：${{ env.LAN_IP }}
-            预装：meow ${{ env.MEOW_TAG }}（含中文 LuCI）、easytier ${{ env.EASYTIER_TAG }} noweb（含中文 LuCI）、UPnP（含中文 LuCI）
-            内核模块：kmod-mtd-rw、kmod-tun、kmod-dummy、kmod-nft-tproxy/socket/nat/fib、kmod-ppp/pppoe/pppox
-            拨号：支持 PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp，LuCI 协议里可选）
-            IPv6：默认开启（odhcp6c 拿 DHCPv6-PD，odhcpd 下发 RA/DHCPv6，luci-proto-ipv6 可配）
-            界面：完整 LuCI（luci-base + luci-mod-network/system/status + bootstrap 主题 + uhttpd + rpcd），默认中文
-            meow：Rust 版 mihomo（Clash Meta）内核，LuCI「服务 → meow」里配置
-            easytier：noweb 形态，仅 easytier-core + easytier-cli，不含 easytier-web/easytier-web-embed
-            Shell：预装 bash（默认 shell 仍为 busybox ash，需要时 `bash` 进入）
+            Netcore N60 Pro ｜ MT7986A / 512MB SPI NAND ｜ ubi `${{ env.UBI_506M }}`（506.5 MiB）
+            构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）｜ 默认 LAN `${{ env.LAN_IP }}`（中文界面）
 
-            meow 使用：
-            1. 打开 http://${{ env.LAN_IP }} → 服务 → meow
-            2. 「Configuration」里粘贴 Clash/mihomo 格式 YAML（保存前会用 `meow -t` 校验）
-            3. 「Settings」里勾启用并打开透明代理（默认 tproxy；redirect 为 TCP-only）
-            4. 「Panel」是 meow 自带 Web 面板（端口/密钥也在 Settings 里改）
-            配置文件 /etc/meow/config.yaml，UCI /etc/config/meow；默认不自启动，配好再开。
+            **预装**：LuCI 全套 + meow ${{ env.MEOW_TAG }}（luci-app-meow）+ EasyTier ${{ env.EASYTIER_TAG }} noweb（中文）+ UPnP
+            拨号/网络：PPPoE（ppp + ppp-mod-pppoe + luci-proto-ppp）、IPv6 默认开（odhcp6c + odhcpd）
+            kmod：mtd-rw / tun / dummy / nft-tproxy,socket,nat,fib / ppp,pppoe,pppox
 
-            刷机：
-            - 已经是 506M 分区：直接 sysupgrade（可保留配置）
-            - 从 128M 原厂分区跨过来：必须先用目标分区表的内核（recovery）引导再刷，且不要保留配置
-            - meow / TUN / easytier 都是用户态处理，建议关掉 packet steering 与 flow offloading：
-              ```
-              uci set network.@device[0].packet_steering='0'
-              uci set firewall.@defaults[0].flow_offloading='0'
-              uci set firewall.@defaults[0].flow_offloading_hw='0'
-              uci commit && /etc/init.d/network reload && /etc/init.d/firewall restart
-              ```
+            **meow**：`http://${{ env.LAN_IP }}` → 服务 → meow
+            - Configuration 贴 mihomo/Clash YAML（保存前 `meow -t` 校验）；Settings 勾启用 + 开透明代理（默认 tproxy）
+            - 配置文件 `/etc/meow/config.yaml`，默认不自启动；easytier 在「服务 → EasyTier」里启用
 
-            说明：meow 的包未签名（构建时用 --allow-untrusted 装进去），后续升级请用
-            `apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk`。
-            snapshot 是滚动版本，内核与 kmod ABI 会变，kmod 必须与镜像来自同一次构建；
-            升级请整包 sysupgrade，不要往 snapshot 机器上装正式版 kmod（反之亦然）。
+            **刷机**：同为 506M 分区可直接 sysupgrade；从 128M 原厂跨过来必须先刷目标分区表的 recovery，且不保留配置
+
+            **提示**：建议关掉 flow_offloading 与 packet_steering；
+            meow 包未签名，升级用 `apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk`；
+            snapshot 是滚动的，kmod 必须与镜像同批，升级请整包 sysupgrade。
           artifacts: out/*
           allowUpdates: true
           removeArtifacts: true
