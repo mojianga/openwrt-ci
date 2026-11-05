@@ -103,18 +103,26 @@ jobs:
         run: |
           set -euo pipefail
           case "$IB_SRC" in
-            immortalwrt|ImmortalWrt|IWRT)
+            immortalwrt|ImmortalWrt|IMMORTALWRT|iwrt|imm)
               BASE_URL=https://downloads.immortalwrt.org/snapshots
               IB_FILE=immortalwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
               DISTRIB=IMMORTALWRT-SNAPSHOT
+              PREFIX=immortalwrt
               ;;
-            *)
+            openwrt|OpenWrt|OPENWRT|owrt|"")
               BASE_URL=https://downloads.openwrt.org/snapshots
               IB_FILE=openwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
-              DISTRIB=SNAPSHOT
+              DISTRIB=OPENWRT-SNAPSHOT
+              PREFIX=openwrt
+              ;;
+            *)
+              echo "ERROR: source 只能是 openwrt 或 immortalwrt（当前：$IB_SRC）"
+              exit 1
               ;;
           esac
           IB_URL="${BASE_URL}/targets/qualcommax/ipq60xx/${IB_FILE}"
+          echo "IB_BASE_URL=$BASE_URL" >> "$GITHUB_ENV"
+          echo "IB_PREFIX=$PREFIX" >> "$GITHUB_ENV"
           echo "source = $DISTRIB"
           echo "IB_URL = $IB_URL"
 
@@ -124,10 +132,17 @@ jobs:
           [ -d "$IB" ] || { echo "ERROR: 解压后没找到 ImageBuilder 目录"; ls -al; exit 1; }
           echo "IB_DIR=$IB" >> "$GITHUB_ENV"
           BUILDINFO=$(curl -fsSL --retry 3 "${BASE_URL}/targets/qualcommax/ipq60xx/version.buildinfo" | head -1 | tr -d '\r\n' || true)
-          echo "OPENWRT_VER=${DISTRIB}(${BUILDINFO:-unknown})" >> "$GITHUB_ENV"
+          echo "OPENWRT_DISTRIB=$DISTRIB" >> "$GITHUB_ENV"
+          echo "OPENWRT_BUILD=${BUILDINFO:-unknown}" >> "$GITHUB_ENV"
           echo "ImageBuilder = $IB ($DISTRIB build ${BUILDINFO:-unknown})"
 
           cd "$IB"
+          # 本流程只支持 apk 体系（25.12+/snapshot）；opkg 时代的 ImageBuilder 要 .ipk，这里不覆盖
+          if [ ! -f repositories ] && [ -f repositories.conf ]; then
+            echo "ERROR: 这个 ImageBuilder 是 opkg 体系（只有 repositories.conf），本流程按 apk 处理"
+            exit 1
+          fi
+
           # ImageBuilder 默认不产 initramfs 镜像（tarball 里的 .config 没开 INITRAMFS），
           # 而首次刷机要靠它引导，所以显式打开；万一没开成功，verify 步骤只告警不失败。
           if [ -f .config ]; then
@@ -288,25 +303,41 @@ jobs:
           T=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
           [ -n "$T" ] || { echo "ERROR: 找不到 TARGET_DIR"; exit 1; }
 
-          # 产物前缀随源变化（openwrt- / immortalwrt-），一律用 glob 取
-          SYS=$(ls "$IMG"/*squashfs-sysupgrade.bin 2>/dev/null | head -1)
+          # 产物前缀随源变化（openwrt- / immortalwrt-），一律用 glob 取；
+          # 注意 pipefail 下 ls 匹配不到会返回 2，必须兜住，否则 set -e 直接静默退出
+          SYS=$(ls "$IMG"/*squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
           [ -n "$SYS" ] || { echo "ERROR: 没有产出 squashfs-sysupgrade.bin"; ls -lh "$IMG"; exit 1; }
           echo "  OK   $(basename "$SYS") ($(du -h "$SYS" | cut -f1))"
 
-          # initramfs 只告警（没开 INITRAMFS 时确实不产）
-          INIT=$(ls "$IMG"/*initramfs-uImage.itb 2>/dev/null | head -1)
-          if [ -n "$INIT" ]; then
-            echo "  OK   $(basename "$INIT")"
+          # initramfs：IB 不一定产（ImmortalWrt 就不产），没有就从上游下载同 snapshot 的引导镜像
+          INIT=$(ls "$IMG"/*initramfs* 2>/dev/null | head -1 || true)
+          if [ -z "$INIT" ]; then
+            INIT_NAME="${IB_PREFIX}-qualcommax-ipq60xx-${PROFILE}-initramfs-uImage.itb"
+            echo "  IB 没产 initramfs，尝试下载上游引导镜像：$INIT_NAME"
+            if curl -fsSL --retry 2 --max-time 120 -o "$INIT_NAME" \
+                 "${IB_BASE_URL}/targets/qualcommax/ipq60xx/${INIT_NAME}"; then
+              INIT="$PWD/$INIT_NAME"
+              echo "  OK   $(basename "$INIT_NAME")（来自上游，仅用于首次引导）"
+            else
+              echo "  WARN 上游也没有 initramfs，首次刷机请自行准备 rescue 镜像"
+            fi
           else
-            echo "  WARN 没有 initramfs 镜像，首次刷机请用同一 snapshot 的 initramfs 引导"
+            echo "  OK   $(basename "$INIT")"
           fi
 
           fail=0
           need() { [ -e "$T$1" ] && echo "  OK   $1" || { echo "  MISS $1"; fail=1; }; }
-          # 包按 apk 数据库校验（路径无关，比猜文件可靠）
+          # 包按包数据库校验（apk：25.12+/snapshot；opkg：老版本），路径无关，比猜文件可靠
           pkg() {
-            [ -f "$T/lib/apk/db/installed" ] || { echo "  WARN 无 apk db，跳过 $1"; return 0; }
-            grep -qx "P:$1" "$T/lib/apk/db/installed" && echo "  OK   pkg:$1" || { echo "  MISS pkg:$1"; fail=1; }
+            if [ -f "$T/lib/apk/db/installed" ]; then
+              grep -qx "P:$1" "$T/lib/apk/db/installed" \
+                && echo "  OK   pkg:$1" || { echo "  MISS pkg:$1"; fail=1; }
+            elif [ -f "$T/usr/lib/opkg/status" ]; then
+              grep -qx "Package: $1" "$T/usr/lib/opkg/status" \
+                && echo "  OK   pkg:$1" || { echo "  MISS pkg:$1"; fail=1; }
+            else
+              echo "  WARN 读不到包数据库，跳过 pkg:$1"
+            fi
           }
 
           for P in meow luci-app-meow luci-base luci-i18n-base-zh-cn kmod-tun kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket; do pkg "$P"; done
@@ -369,11 +400,13 @@ jobs:
 
           # ---------- 收集产物 ----------
           OUT="$GITHUB_WORKSPACE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
-          cp -f "$SYS" "$OUT/"
-          [ -n "$INIT" ] && cp -f "$INIT" "$OUT/" || true
+          cp -f "$SYS" "$OUT/$(basename "$SYS")"
+          if [ -n "$INIT" ]; then
+            cp -f "$INIT" "$OUT/$(basename "$INIT")"
+          fi
           {
             echo "device  : JDCloud ${DEVICE_NAME} (${PROFILE})"
-            echo "openwrt : ${OPENWRT_VER}"
+            echo "source  : ${OPENWRT_DISTRIB} (${OPENWRT_BUILD})"
             echo "meow    : ${MEOW_TAG}  (${MEOW_PKG})"
             echo "easytier: ${EASYTIER_TAG}"
             echo "lan ip  : ${LAN_IP}"
@@ -393,43 +426,19 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: out/*
           body: |
-            JDCloud 太乙 RE-CS-07 / IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi
-            构建源：${{ env.OPENWRT_VER }}（profile `jdcloud_re-cs-07`）
-            默认 LAN：${{ env.LAN_IP }}，主机名 Taiyi，LuCI 默认中文
+            JDCloud 太乙 RE-CS-07 ｜ IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi
+            构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）｜ profile `jdcloud_re-cs-07` ｜ 默认 LAN `${{ env.LAN_IP }}`（中文界面）
 
-            预装：
-            - LuCI 完整界面（luci-base + mod-network/system/status + bootstrap 主题 + uhttpd + rpcd）
-            - **meow** ${{ env.MEOW_TAG }}（Rust 版 mihomo/Clash Meta 内核）+ luci-app-meow：
-              LuCI「服务 → meow」里配置（Overview / Panel / Configuration / Clients / Settings / Log）
-            - EasyTier ${{ env.EASYTIER_TAG }}（noweb：core + cli）+ luci-app-easytier + 中文翻译
-            - kmod-tun / kmod-mtd-rw / kmod-nft-tproxy / kmod-nft-socket / kmod-nft-nat / kmod-nft-fib / kmod-inet-diag
+            **预装**：LuCI 全套 + meow ${{ env.MEOW_TAG }}（luci-app-meow）+ EasyTier ${{ env.EASYTIER_TAG }} noweb（中文）
+            kmod：tun / mtd-rw / nft-tproxy / nft-socket / nft-nat / nft-fib / inet-diag / fs-f2fs
 
-            meow 使用：
-            1. 打开 http://${{ env.LAN_IP }} → 服务 → meow
-            2. 在「Configuration」里粘贴 Clash/mihomo 格式的 YAML（保存前会用 `meow -t` 校验）
-            3. 到「Settings」勾启用，打开透明代理（默认 tproxy；redirect 为 TCP-only）
-            4. 「Panel」页是 meow 自带 Web 面板（端口/密钥在 Settings 里改）
-            注意：meow 默认不启动；配置文件是 /etc/meow/config.yaml，UCI 在 /etc/config/meow
+            **meow**：`http://${{ env.LAN_IP }}` → 服务 → meow
+            - Configuration 贴 mihomo/Clash YAML（保存前 `meow -t` 校验）；Settings 勾启用 + 开透明代理（默认 tproxy）
+            - 配置文件 `/etc/meow/config.yaml`，默认不自启动；easytier 在「服务 → EasyTier」里启用
 
-            easytier：服务 → EasyTier 里配置启用（easytier-core 已就位）。
-            kmod-mtd-rw：`insmod mtd-rw i_want_a_brick=1`（临时解除写保护，机器不再「防砖」）。
+            **刷机**：U-Boot 引导 `initramfs-uImage.itb` → 系统里 `sysupgrade -n *-squashfs-sysupgrade.bin`
+            需第三方 U-Boot `uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin`（machid 0x8030202，别用 cs-02 的）
 
-            刷机：
-            1. 需第三方 U-Boot（uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin，machid 0x8030202；不要用 cs-02 的）
-            2. 官方 profile 没有 factory：先在 U-Boot 里引导 initramfs-uImage.itb
-               （若没有 initramfs 附件，用 downloads.openwrt.org 同 snapshot 的 initramfs 引导，
-                它只负责把系统跑起来，写完 sysupgrade 后就被覆盖）
-            3. 进系统后 `sysupgrade -n <squashfs-sysupgrade.bin>` 写 eMMC（首次刷写不要保留配置）
-
-            建议关掉硬件卸载（meow/TUN/easytier 都在用户态，offload 帮不上忙还可能绕过规则）：
-            ```
-            uci set network.@device[0].packet_steering='0'
-            uci set firewall.@defaults[0].flow_offloading='0'
-            uci set firewall.@defaults[0].flow_offloading_hw='0'
-            uci commit && /etc/init.d/network reload && /etc/init.d/firewall restart
-            ```
-
-            注意：meow 的包未签名（构建时用 --allow-untrusted 装进去），后续升级请用
-            `apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk`；
-            snapshot 是滚动版本，社区反馈主线固件曾缺 f2fs 导致 overlay 不持久化，
-            刷完请先验证「改配置 → 重启 → 配置是否保留」。
+            **提示**：meow/TUN/easytier 都在用户态，建议关掉 flow_offloading 与 packet_steering；
+            meow 包未签名，升级用 `apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk`。
+            snapshot 是滚动的，刷完先验证「改配置 → 重启 → 配置是否保留」（f2fs/overlay）。
