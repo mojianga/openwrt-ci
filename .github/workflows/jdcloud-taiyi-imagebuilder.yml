@@ -1,9 +1,9 @@
 name: jdcloud-taiyi-imagebuilder
 
 # 京东云 太乙 RE-CS-07（JDCloud Taiyi / IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi）
-# 基于 ImmortalWrt snapshot ImageBuilder（默认源；该机型在官方 25.12.x 正式版里没有）
-# 构建源可切：source=immortalwrt（默认）/ openwrt（官方 snapshot，feed 修复后可切回去）。
-#   之前用官方 snapshot 出过 procd 已更新、配套 libubox 没发出来的半同步问题，故默认走 ImmortalWrt。
+# 基于 OpenWrt 官方 snapshot ImageBuilder（默认源；该机型在官方 25.12.x 正式版里没有）
+# 构建源可切：source=openwrt（默认）/ immortalwrt（应急）。
+#   官方 snapshot 偶尔出现 procd 已更新、配套 libubox 没发出来的半同步，此时切 immortalwrt 立刻能出固件。
 #
 # snapshot 默认什么都不带，所以这里补：
 #   1) LuCI 全家桶 + 中文（luci-i18n-base-zh-cn + uci-defaults 设 zh_cn），否则刷完没有 web 界面
@@ -42,9 +42,9 @@ on:
         required: false
         default: ''
       source:
-        description: '构建源：immortalwrt（默认，feed 自洽）/ openwrt（官方 snapshot 修好后可切）'
+        description: '构建源：openwrt（默认官方 snapshot）/ immortalwrt（官方 feed 半同步时应急）'
         required: false
-        default: 'immortalwrt'
+        default: 'openwrt'
   # 点 star 触发（只在默认分支生效）
   watch:
     types: [started]
@@ -60,9 +60,9 @@ permissions:
   contents: write
 
 env:
-  # 上游源：默认 ImmortalWrt snapshot（feed 自洽、有本机型）；
-  # 官方 OpenWrt snapshot 修好后可把 source 填 openwrt 切回去
-  IB_SRC: ${{ github.event.inputs.source || 'immortalwrt' }}
+  # 上游源：默认官方 OpenWrt snapshot；
+  # 若官方 feed 出现半同步（procd 新了但配套 libubox 没发），把 source 填 immortalwrt 应急
+  IB_SRC: ${{ github.event.inputs.source || 'openwrt' }}
   PROFILE: jdcloud_re-cs-07
   PKG_ARCH: aarch64_cortex-a53
   DEVICE_NAME: jdcloud-re-cs-07
@@ -285,7 +285,7 @@ jobs:
             } | sort -u | sed 's/^/  缺: /'
             echo "----------------------------------------"
             echo "排查提示："
-            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑"
+            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑，或把 source 填 immortalwrt"
             echo "  - 报 'package mentioned in index not found'：packages/ 里的 .apk 文件名必须是 <name>-<version>.apk"
             echo "  - 其他：看上面 apk 报错原文"
             exit 1
@@ -420,7 +420,6 @@ jobs:
         with:
           tag: ${{ env.RELEASE_TAG }}
           name: JDCloud Taiyi RE-CS-07 (LuCI + meow + easytier)
-          prerelease: true
           allowUpdates: true
           removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
