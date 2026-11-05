@@ -200,7 +200,9 @@ jobs:
           echo "LAN IP = $LAN_IP, easytier = $ET"
           find files -type f | head -20
 
-      # snapshot 的包名会变：构建失败时从日志里认出「不存在」的包，剔掉重试
+      # snapshot 的源是滚动的，失败要分两类处理：
+      #   1) 我们点名的包不存在（包名变了）        -> 从列表里剔掉重试
+      #   2) 缺的包不在我们列表里（上游依赖断裂）  -> buildbot 正在重建 feed，等几分钟重试（不能靠剔包）
       - name: Make image
         run: |
           set -uo pipefail
@@ -211,9 +213,11 @@ jobs:
           sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
           grep -q "allow-untrusted" Makefile || echo "WARNING: 没匹配到 apk add，靠 packages.adb 索引"
 
-          for attempt in 1 2 3; do
+          prune=0
+          feed_retry=0
+          while :; do
             ALL=$(tr '\n' ' ' < pkgs.txt)
-            echo "=== make image #$attempt（$(wc -l < pkgs.txt) 个包）==="
+            echo "=== make image（$(wc -l < pkgs.txt) 个包；已剔除 $prune 次 / 已等上游 $feed_retry 次）==="
             if make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$ALL" > build.log 2>&1; then
               echo "=== BUILD OK ==="
               break
@@ -224,13 +228,33 @@ jobs:
             { grep -oE "Unknown package '[^']+'" build.log | sed -E "s/.*'(.*)'/\1/" || true
               grep -oE "[A-Za-z0-9._+-]+ \(no such package\)" build.log | sed 's/ (no such package)//' || true
             } | sort -u > missing.txt
-            [ -s missing.txt ] || { echo "ERROR: 构建失败，且没有可剔除的包名（见上面日志）"; exit 1; }
-            [ "$attempt" -lt 3 ] || { echo "ERROR: 重试 3 次仍失败"; exit 1; }
+            [ -s missing.txt ] || { echo "ERROR: 构建失败，日志里没有可识别的包名"; exit 1; }
 
-            echo "--- 源里不存在，丢弃后重试：$(tr '\n' ' ' < missing.txt)"
-            grep -vxF -f missing.txt pkgs.txt > pkgs.new || true
-            [ -s pkgs.new ] || { echo "ERROR: 包列表被清空"; exit 1; }
-            mv pkgs.new pkgs.txt
+            # 只保留「我们自己点名、且源里确实没有」的包；依赖链断裂剔包没用
+            grep -xF -f pkgs.txt missing.txt > ours.txt || true
+
+            if [ -s ours.txt ]; then
+              prune=$((prune + 1))
+              [ "$prune" -le 2 ] || { echo "ERROR: 剔除 2 次仍然失败"; exit 1; }
+              echo "--- 源里没有这些包，丢弃后重试：$(tr '\n' ' ' < ours.txt)"
+              grep -vxF -f ours.txt pkgs.txt > pkgs.new || true
+              [ -s pkgs.new ] || { echo "ERROR: 包列表被清空"; exit 1; }
+              mv pkgs.new pkgs.txt
+              continue
+            fi
+
+            # 缺的包不是我们请求的 => snapshot 的 feed 与镜像不同步（buildbot 正在重建）
+            feed_retry=$((feed_retry + 1))
+            echo "!!! 上游依赖断裂（这些包不在我们的请求列表里）：$(tr '\n' ' ' < missing.txt)"
+            echo "!!! 典型原因：OpenWrt snapshot 正在重建，base/packages 源里的库版本还没对齐。"
+            if [ "$feed_retry" -gt 3 ]; then
+              echo "ERROR: 已等 3 轮（约 9 分钟），snapshot 仍然不同步。"
+              echo "       过 10~30 分钟重跑即可；也可以看 https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/ 的构建时间"
+              exit 1
+            fi
+            echo "!!! 清掉 dl 缓存后等待 180s 再试（$feed_retry/3）"
+            rm -rf dl
+            sleep 180
           done
 
           echo "PKGS_FINAL=$(tr '\n' ' ' < pkgs.txt)" >> "$GITHUB_ENV"
