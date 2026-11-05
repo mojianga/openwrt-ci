@@ -1,8 +1,8 @@
 name: netcore-n60pro-imagebuilder-506m
 
-# 思路（默认 ImmortalWrt snapshot，必要时可切官方 OpenWrt）：
-#   1) ImageBuilder 组装 rootfs；source=immortalwrt（默认，snapshot）| openwrt（snapshot 或正式版）
-#      官方 snapshot 的 feed 之前出现过半同步（procd 已更新但配套 libubox 没发），故默认走 ImmortalWrt
+# 思路（默认官方 OpenWrt，必要时可切 ImmortalWrt）：
+#   1) ImageBuilder 组装 rootfs；source=openwrt（默认，snapshot 或正式版）| immortalwrt（snapshot）
+#      若官方 snapshot 出现 feed 半同步（procd 已更新但配套 libubox 没发），切 immortalwrt 应急
 #      - 默认跟 snapshot（内核 6.18.x，最新驱动）
 #      - 想要固定 ABI / 可复现就把 openwrt_version 填 25.12.6（内核 6.12.x）
 #      - snapshot 是滚动的：kmod ABI 每天可能变，固件里的 kmod 必须与同一次构建的镜像配套
@@ -47,7 +47,7 @@ on:
         required: false
         default: '192.168.12.1'
       source:
-        description: '构建源：immortalwrt（默认，feed 自洽）/ openwrt（官方源修好后可切）'
+        description: '构建源：openwrt（默认官方）/ immortalwrt（官方 feed 半同步时应急）'
         required: false
         default: 'openwrt'
   # 点 star 触发；watch 事件只会触发「默认分支」上的 workflow
@@ -67,8 +67,8 @@ permissions:
 env:
   # openwrt 源时：release 或 snapshot 由 OPENWRT_VER 决定，IB_URL 在下载步骤里拼
   OPENWRT_VER: ${{ github.event.inputs.openwrt_version || 'snapshot' }}
-  # 默认走 ImmortalWrt snapshot（feed 自洽、两个机型都有）；官方源修好后可填 openwrt 切回去
-  IB_SRC: ${{ github.event.inputs.source || 'immortalwrt' }}
+  # 默认走官方 OpenWrt；若官方 feed 半同步（procd 新了但 libubox 没发），把 source 填 immortalwrt 应急
+  IB_SRC: ${{ github.event.inputs.source || 'openwrt' }}
   PROFILE: netcore_n60-pro
   PKG_ARCH: aarch64_cortex-a53
   DEVICE_NAME: netcore-n60-pro
@@ -349,7 +349,7 @@ jobs:
             } | sort -u | sed 's/^/  缺: /'
             echo "----------------------------------------"
             echo "排查提示："
-            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑"
+            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建；过几小时重跑，或 openwrt_version 填 25.12.6 / source 填 immortalwrt"
             echo "  - 报 'package mentioned in index not found'：packages/ 里的 .apk 必须是 <name>-<version>.apk 命名"
             echo "  - 其他：看上面 apk 报错原文"
             return 1
