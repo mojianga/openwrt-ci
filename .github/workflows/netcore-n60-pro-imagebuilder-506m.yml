@@ -49,7 +49,7 @@ on:
       source:
         description: '构建源：immortalwrt（默认，feed 自洽）/ openwrt（官方源修好后可切）'
         required: false
-        default: 'immortalwrt'
+        default: 'openwrt'
   # 点 star 触发；watch 事件只会触发「默认分支」上的 workflow
   watch:
     types: [started]
