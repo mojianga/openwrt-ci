@@ -246,15 +246,16 @@ jobs:
             # 缺的包不是我们请求的 => snapshot 的 feed 与镜像不同步（buildbot 正在重建）
             feed_retry=$((feed_retry + 1))
             echo "!!! 上游依赖断裂（这些包不在我们的请求列表里）：$(tr '\n' ' ' < missing.txt)"
-            echo "!!! 典型原因：OpenWrt snapshot 正在重建，base/packages 源里的库版本还没对齐。"
-            if [ "$feed_retry" -gt 3 ]; then
-              echo "ERROR: 已等 3 轮（约 9 分钟），snapshot 仍然不同步。"
-              echo "       过 10~30 分钟重跑即可；也可以看 https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/ 的构建时间"
+            echo "!!! 典型原因：OpenWrt snapshot 正在重建，base 源里 procd/mtd 已更新但配套的 libubox 还没发出来"
+            if [ "$feed_retry" -gt 4 ]; then
+              echo "ERROR: 已等 4 轮（约 16 分钟），snapshot 仍然不同步。"
+              echo "       过几小时重跑即可（太乙只在 snapshot 里，没有正式版可退）；"
+              echo "       也可以看 https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx/ 的构建时间"
               exit 1
             fi
-            echo "!!! 清掉 dl 缓存后等待 180s 再试（$feed_retry/3）"
+            echo "!!! 清掉 dl 缓存后等待 240s 再试（$feed_retry/4）"
             rm -rf dl
-            sleep 180
+            sleep 240
           done
 
           echo "PKGS_FINAL=$(tr '\n' ' ' < pkgs.txt)" >> "$GITHUB_ENV"
