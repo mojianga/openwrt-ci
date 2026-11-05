@@ -286,11 +286,56 @@ jobs:
         run: |
           set -euo pipefail
           cd "$IB_DIR"
-          PACKAGES="$PKGS_BASE $PKGS_PPPOE $PKGS_IPV6"
-          echo "PACKAGES=$PACKAGES"
+          printf '%s\n' $PKGS_BASE $PKGS_PPPOE $PKGS_IPV6 | tr -s '[:space:]' '\n' | grep -v '^$' | sort -u > pkgs.txt
+          echo "包数量: $(wc -l < pkgs.txt)"
+
+          # snapshot 的源是滚动的，失败分两类处理：
+          #   1) 我们点名的包不存在（包名变了）        -> 剔掉重试（最多 2 次）
+          #   2) 缺的包不在我们列表里（上游依赖断裂）  -> buildbot 正在重建 feed，等一会重试（不能靠剔包）
+          run_make_image() {
+            prune=0
+            feed_retry=0
+            while :; do
+              ALL=$(tr '\n' ' ' < pkgs.txt)
+              echo "--- make image（$(wc -l < pkgs.txt) 个包；已剔除 $prune / 已等上游 $feed_retry）---"
+              if make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$ALL" > build.log 2>&1; then
+                return 0
+              fi
+              tail -25 build.log
+
+              { grep -oE "Unknown package '[^']+'" build.log | sed -E "s/.*'(.*)'/\1/" || true
+                grep -oE "[A-Za-z0-9._+-]+ \(no such package\)" build.log | sed 's/ (no such package)//' || true
+              } | sort -u > missing.txt
+              [ -s missing.txt ] || { echo "ERROR: 构建失败，日志里没有可识别的包名"; return 1; }
+
+              # 只保留「我们自己点名、且源里确实没有」的包；依赖链断裂剔包没用
+              grep -xF -f pkgs.txt missing.txt > ours.txt || true
+              if [ -s ours.txt ]; then
+                prune=$((prune + 1))
+                [ "$prune" -le 2 ] || { echo "ERROR: 剔除 2 次仍然失败"; return 1; }
+                echo "  源里没有 $(tr '\n' ' ' < ours.txt)，剔除后重试"
+                grep -vxF -f ours.txt pkgs.txt > pkgs.new || true
+                [ -s pkgs.new ] || { echo "ERROR: 包列表被清空"; return 1; }
+                mv pkgs.new pkgs.txt
+                continue
+              fi
+
+              feed_retry=$((feed_retry + 1))
+              echo "  上游依赖断裂（这些包不在我们的请求列表里）：$(tr '\n' ' ' < missing.txt)"
+              echo "  典型原因：OpenWrt snapshot 正在重建，base 源里 procd/mtd 已更新但配套的 libubox 还没发出来"
+              if [ "$feed_retry" -gt 4 ]; then
+                echo "ERROR: 已等 4 轮（约 16 分钟），snapshot 仍然不同步。"
+                echo "       过几小时重跑；或把 openwrt_version 填 25.12.6（正式版源是自洽的，本机型支持）"
+                return 1
+              fi
+              echo "  清 dl 缓存后等 240s 再试（$feed_retry/4）"
+              rm -rf dl
+              sleep 240
+            done
+          }
 
           echo "=== 第 1 次 make image：生成 build_dir 里的 dtb ==="
-          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
+          run_make_image
 
           DTB=$(find build_dir -name "image-mt7986a-netcore-n60-pro.dtb" | head -1)
           [ -n "$DTB" ] || { echo "ERROR: build_dir 里找不到 dtb"; find build_dir -name "*.dtb" | head; exit 1; }
@@ -328,7 +373,7 @@ jobs:
           echo "=== 第 2 次 make image：用改好的 dtb 重打 FIT ==="
           cp -f dtb-506m.dtb "$DTB"
           rm -f bin/targets/mediatek/filogic/*sysupgrade.itb
-          make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES"
+          run_make_image
 
           NEW=$(ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.itb 2>/dev/null | head -1)
           [ -n "$NEW" ] || { echo "ERROR: 没有产出 sysupgrade.itb"; ls -l bin/targets/mediatek/filogic; exit 1; }
