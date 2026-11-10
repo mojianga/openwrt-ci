@@ -1,54 +1,50 @@
 name: jdcloud-taiyi-imagebuilder
 
-# 京东云 太乙 RE-CS-07（JDCloud Taiyi / IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi）
-# 基于 OpenWrt 官方 snapshot ImageBuilder（默认源；该机型在官方 25.12.x 正式版里没有）
-# 构建源可切：source=openwrt（默认）/ immortalwrt（应急）。
-#   官方 snapshot 偶尔出现 procd 已更新、配套 libubox 没发出来的半同步，此时切 immortalwrt 立刻能出固件。
+# ===========================================================================
+#  京东云 太乙 RE-CS-07 ｜ IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi
+#  OpenWrt 官方 snapshot ImageBuilder（该机型官方没有正式版，只能跟 snapshot）
+# ---------------------------------------------------------------------------
+#  预装软件（开关优先级：dispatch 输入 > 仓库变量 > 默认值）
+#    ENABLE_MOMO=true       momo + luci-app-momo + sing-box（momo 依赖 sing-box，绑一起）
+#    ENABLE_EASYTIER=true   EasyTier（noweb）+ luci-app-easytier + 中文
+#    ENABLE_MEOW=false      meow-rs（Rust 版 mihomo）
 #
-# snapshot 默认什么都不带，所以这里补：
-#   1) LuCI 全家桶 + 中文（luci-i18n-base-zh-cn + uci-defaults 设 zh_cn），否则刷完没有 web 界面
-#   2) meow（https://github.com/meow-rs/meow-rs，Rust 版 mihomo/Clash Meta 内核）
-#      官方直接产出 OpenWrt 包：meow_<ver>-r1_<arch>.apk + luci-app-meow_<ver>-r1_all.apk，
-#      内含 /usr/bin/meow、/etc/init.d/meow（procd）、/etc/config/meow、/etc/meow/config.yaml
-#      以及 LuCI「服务 → meow」面板（状态/配置编辑/客户端/tproxy 开关）。
-#      meow 不提供 apk feed，只能拿 release 里的包；ImageBuilder 会把 packages/ 顶层的 *.apk
-#      自动 apk mkndx 成 packages.adb，然后按包名安装（这就是这里把包拷进 packages/ 的原因）。
-#      包未签名，所以给 apk add 加 --allow-untrusted。
-#      透明代理需要 kmod-nft-socket / kmod-nft-tproxy（默认 tproxy 模式）。
-#   3) easytier：release 二进制 noweb 形态（core + cli）+ 上游 luci-app-easytier + 中文 lmo
-#   4) kmod-mtd-rw / kmod-tun / kmod-fs-f2fs / mkf2fs 等
+#  sing-box 不用 feed 版本：始终取 SagerNet/sing-box 最新 release 的静态二进制，
+#  覆盖 /usr/bin/sing-box（momo / EasyTier / meow 同样都取各自上游 latest，无需指定版本）
+#  momo 走自建签名 feed，公钥预置在 /etc/apk/keys/momo.pem
 #
-# 刷机前提：官方 profile 只有 sysupgrade / initramfs、没有 factory，
-#   需先刷第三方 U-Boot（uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin，machid 0x8030202，别用 cs-02 的），
-#   U-Boot 里先引导 initramfs，再 sysupgrade 写 eMMC。
+#  刷机前提：官方 profile 只有 sysupgrade / initramfs，没有 factory
+#    需先刷第三方 U-Boot（uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin，machid 0x8030202）
+#    U-Boot 里先引导 initramfs，再 sysupgrade 写 eMMC
+# ===========================================================================
 
 on:
   workflow_dispatch:
     inputs:
-      meow_version:
-        description: 'meow-rs tag（留空=latest，例如 v0.28.0）'
-        required: false
-        default: ''
-      easytier_version:
-        description: 'EasyTier tag（留空=latest）'
-        required: false
-        default: ''
       lan_ip:
         description: '默认 LAN IP'
         required: false
         default: '192.168.22.1'
+      enable_momo:
+        description: 'momo + sing-box；留空=仓库变量 ENABLE_MOMO 或默认 true'
+        required: false
+        default: ''
+      enable_easytier:
+        description: 'EasyTier；留空=仓库变量 ENABLE_EASYTIER 或默认 true'
+        required: false
+        default: ''
+      enable_meow:
+        description: 'meow-rs；留空=仓库变量 ENABLE_MEOW 或默认 false'
+        required: false
+        default: ''
       extra_packages:
         description: '额外 apk 包（空格分隔）'
         required: false
         default: ''
-      source:
-        description: '构建源：openwrt（默认官方 snapshot）/ immortalwrt（官方 feed 半同步时应急）'
-        required: false
-        default: 'openwrt'
   # 点 star 触发（只在默认分支生效）
   watch:
     types: [started]
-  # 定时触发（cron 只有 UTC，没有时区参数）：每周日 03:00 UTC = 北京 11:00
+  # 定时触发（cron 只有 UTC）：每周日 03:00 UTC = 北京 11:00
   schedule:
     - cron: '0 3 * * 0'
 
@@ -60,24 +56,35 @@ permissions:
   contents: write
 
 env:
-  # 上游源：默认官方 OpenWrt snapshot；
-  # 若官方 feed 出现半同步（procd 新了但配套 libubox 没发），把 source 填 immortalwrt 应急
-  IB_SRC: ${{ github.event.inputs.source || 'openwrt' }}
+  # ---- 设备 ----
   PROFILE: jdcloud_re-cs-07
   PKG_ARCH: aarch64_cortex-a53
   DEVICE_NAME: jdcloud-re-cs-07
   RELEASE_TAG: jdcloud-taiyi-snapshot
-  # 点 star / 定时触发时 inputs 为空，这里统一兜底
+  IB_BASE_URL: https://downloads.openwrt.org/snapshots
+  IB_PREFIX: openwrt
+
+  # ---- 默认值 ----
   LAN_IP: ${{ github.event.inputs.lan_ip || '192.168.22.1' }}
   EXTRA_PKGS: ${{ github.event.inputs.extra_packages }}
-  MEOW_TAG_INPUT: ${{ github.event.inputs.meow_version }}
-  ET_TAG_INPUT: ${{ github.event.inputs.easytier_version }}
-  # LuCI 框架/模块/主题/web 服务 + 中文 + meow（含 LuCI）+ 透明代理与常用 kmod
-  PKGS: luci luci-base luci-mod-network luci-mod-system luci-mod-status luci-theme-bootstrap uhttpd uhttpd-mod-ubus rpcd rpcd-mod-luci rpcd-mod-file rpcd-mod-rrdns luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn bash ca-bundle curl firewall4 ip-full meow luci-app-meow kmod-tun kmod-mtd-rw kmod-nft-socket kmod-nft-tproxy kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-fs-f2fs mkf2fs
+
+  # ---- 软件开关（dispatch 输入 > 仓库变量 > 默认值）----
+  ENABLE_MOMO: ${{ github.event.inputs.enable_momo || vars.ENABLE_MOMO || 'true' }}
+  ENABLE_EASYTIER: ${{ github.event.inputs.enable_easytier || vars.ENABLE_EASYTIER || 'true' }}
+  ENABLE_MEOW: ${{ github.event.inputs.enable_meow || vars.ENABLE_MEOW || 'false' }}
+
+  # ---- 版本：三个软件都直接取上游 latest，不需要指定 ----
+
+  # ---- momo 签名 apk feed ----
+  MOMO_FEED_BASE: https://momomomo.pages.dev
+
+  # ---- 包列表 ----
+  # LuCI 框架 + 模块 + 主题 + web 服务；透明代理要 nft-socket / nft-tproxy；TUN 要 kmod-tun
+  PKGS: luci luci-base luci-mod-network luci-mod-system luci-mod-status luci-theme-bootstrap uhttpd uhttpd-mod-ubus rpcd rpcd-mod-luci rpcd-mod-file rpcd-mod-rrdns luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio libubus-lua libuci-lua luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn bash ca-bundle curl firewall4 ip-full kmod-tun kmod-mtd-rw kmod-nft-socket kmod-nft-tproxy kmod-nft-nat kmod-nft-fib kmod-inet-diag kmod-fs-f2fs mkf2fs
 
 jobs:
   build:
-    name: ImageBuilder JDCloud RE-CS-07 (snapshot + meow)
+    name: Taiyi RE-CS-07 ImageBuilder
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # 想在公开仓库里只允许特定账号点星触发，就配仓库变量 STAR_ACTOR=<用户名>
@@ -88,7 +95,10 @@ jobs:
       github.actor == vars.STAR_ACTOR
 
     steps:
-      - name: Prepare
+      # =====================================================================
+      #  准备
+      # =====================================================================
+      - name: '[setup] 安装构建依赖'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -96,33 +106,12 @@ jobs:
           sudo -E apt-get -y install --no-install-recommends \
             zstd unzip jq curl git make file python3 gcc libc6-dev binutils
 
-      # 下载 ImageBuilder + 把 meow / luci-app-meow 的 apk 塞进 packages/（IB 会自动建索引）
-      - name: Prepare ImageBuilder (+ meow apk)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: '[setup] 下载 ImageBuilder'
         run: |
           set -euo pipefail
-          case "$IB_SRC" in
-            immortalwrt|ImmortalWrt|IMMORTALWRT|iwrt|imm)
-              BASE_URL=https://downloads.immortalwrt.org/snapshots
-              IB_FILE=immortalwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
-              DISTRIB=IMMORTALWRT-SNAPSHOT
-              PREFIX=immortalwrt
-              ;;
-            openwrt|OpenWrt|OPENWRT|owrt|"")
-              BASE_URL=https://downloads.openwrt.org/snapshots
-              IB_FILE=openwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
-              DISTRIB=OPENWRT-SNAPSHOT
-              PREFIX=openwrt
-              ;;
-            *)
-              echo "ERROR: source 只能是 openwrt 或 immortalwrt（当前：$IB_SRC）"
-              exit 1
-              ;;
-          esac
-          IB_URL="${BASE_URL}/targets/qualcommax/ipq60xx/${IB_FILE}"
-          echo "IB_BASE_URL=$BASE_URL" >> "$GITHUB_ENV"
-          echo "IB_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          IB_FILE=openwrt-imagebuilder-qualcommax-ipq60xx.Linux-x86_64.tar.zst
+          DISTRIB=OPENWRT-SNAPSHOT
+          IB_URL="${IB_BASE_URL}/targets/qualcommax/ipq60xx/${IB_FILE}"
           echo "source = $DISTRIB"
           echo "IB_URL = $IB_URL"
 
@@ -130,35 +119,160 @@ jobs:
           tar --zstd -xf ib.tar.zst
           IB=$(ls -d "$PWD"/*imagebuilder-* | head -1)
           [ -d "$IB" ] || { echo "ERROR: 解压后没找到 ImageBuilder 目录"; ls -al; exit 1; }
-          echo "IB_DIR=$IB" >> "$GITHUB_ENV"
-          BUILDINFO=$(curl -fsSL --retry 3 "${BASE_URL}/targets/qualcommax/ipq60xx/version.buildinfo" | head -1 | tr -d '\r\n' || true)
-          echo "OPENWRT_DISTRIB=$DISTRIB" >> "$GITHUB_ENV"
-          echo "OPENWRT_BUILD=${BUILDINFO:-unknown}" >> "$GITHUB_ENV"
-          echo "ImageBuilder = $IB ($DISTRIB build ${BUILDINFO:-unknown})"
 
-          cd "$IB"
-          # 本流程只支持 apk 体系（25.12+/snapshot）；opkg 时代的 ImageBuilder 要 .ipk，这里不覆盖
-          if [ ! -f repositories ] && [ -f repositories.conf ]; then
-            echo "ERROR: 这个 ImageBuilder 是 opkg 体系（只有 repositories.conf），本流程按 apk 处理"
+          # 本流程按 apk 体系（25.12+/snapshot）走，opkg 时代的不支持
+          [ -f "$IB/repositories" ] || { echo "ERROR: 这个 ImageBuilder 是 opkg 体系"; exit 1; }
+
+          # IB 默认不产 initramfs，而首次刷机要靠它引导，显式打开
+          if [ -f "$IB/.config" ]; then
+            grep -q '^CONFIG_TARGET_ROOTFS_INITRAMFS=y' "$IB/.config" \
+              || echo 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' >> "$IB/.config"
+          fi
+
+          BUILDINFO=$(curl -fsSL --retry 3 "${IB_BASE_URL}/targets/qualcommax/ipq60xx/version.buildinfo" | head -1 | tr -d '\r\n' || true)
+          {
+            echo "IB_DIR=$IB"
+            echo "OPENWRT_DISTRIB=$DISTRIB"
+            echo "OPENWRT_BUILD=${BUILDINFO:-unknown}"
+          } >> "$GITHUB_ENV"
+          echo "ImageBuilder = $IB (${BUILDINFO:-unknown})"
+
+      # =====================================================================
+      #  FILES overlay 基础（LAN IP / hostname / 中文界面）
+      # =====================================================================
+      - name: '[files] 基础配置 overlay'
+        run: |
+          set -euo pipefail
+          rm -rf files
+          mkdir -p files/usr/bin files/etc/uci-defaults
+
+          # uci-defaults 在 network / system 启动前执行，直接生效
+          printf '%s\n' \
+            '#!/bin/sh' \
+            "uci -q set network.lan.ipaddr='${LAN_IP}'" \
+            "uci -q set network.lan.netmask='255.255.255.0'" \
+            "uci -q set system.@system[0].hostname='Taiyi'" \
+            'uci -q commit network' \
+            'uci -q commit system' \
+            'exit 0' \
+            > files/etc/uci-defaults/98-taiyi-net
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            "uci -q set luci.main.lang='zh_cn'" \
+            'uci -q commit luci' \
+            'exit 0' \
+            > files/etc/uci-defaults/99-taiyi-lang
+
+          chmod 0755 files/etc/uci-defaults/*
+          echo "LAN IP = $LAN_IP"
+
+      # =====================================================================
+      #  momo（含 luci-app-momo）
+      # =====================================================================
+      - name: '[momo] 接入 apk feed'
+        if: env.ENABLE_MOMO == 'true'
+        run: |
+          set -euo pipefail
+          cd "$IB_DIR"
+
+          # 本流程固定跟 snapshot，所以 momo 用 SNAPSHOT 分支
+          BRANCH=SNAPSHOT
+          FEED="${MOMO_FEED_BASE}/${BRANCH}/${PKG_ARCH}/momo"
+          echo "momo feed = $FEED"
+
+          # packages.adb 是压缩 ADB，没法 grep 包名；feed 另外提供 index.json
+          curl -fsI --retry 2 "${FEED}/packages.adb" > /dev/null \
+            || { echo "ERROR: ${FEED}/packages.adb 不存在"; exit 1; }
+          curl -fsSL --retry 3 -o momo.index.json "${FEED}/index.json" \
+            || { echo "ERROR: 取不到 ${FEED}/index.json"; exit 1; }
+          for P in momo luci-app-momo; do
+            jq -e --arg p "$P" '.packages[$p]' momo.index.json > /dev/null \
+              || { echo "ERROR: momo feed 里没有包 $P"; jq -r '.packages | keys[]' momo.index.json; exit 1; }
+          done
+
+          MOMO_PKGS="momo luci-app-momo"
+          if jq -e '.packages["luci-i18n-momo-zh-cn"]' momo.index.json > /dev/null; then
+            MOMO_PKGS="$MOMO_PKGS luci-i18n-momo-zh-cn"
+          else
+            echo "WARN momo feed 里没有 luci-i18n-momo-zh-cn，界面只有英文"
+          fi
+          {
+            echo "MOMO_PKGS=$MOMO_PKGS"
+            echo "MOMO_BRANCH=$BRANCH"
+          } >> "$GITHUB_ENV"
+
+          # 构建期：源写进 repositories，公钥放 keys/（组装时会被装到 /etc/apk/keys/）
+          grep -qF "$FEED/packages.adb" repositories || echo "$FEED/packages.adb" >> repositories
+          curl -fsSL --retry 3 -o public-key.pem "${MOMO_FEED_BASE}/public-key.pem"
+          mkdir -p keys
+          cp -f public-key.pem keys/momo.pem
+
+          # 刷机后：公钥 + 源也放进固件，apk update / 装语言包不用再跑 feed.sh
+          # 注意这里已经 cd 到 IB 目录，FILES 必须用 GITHUB_WORKSPACE 的绝对路径
+          mkdir -p "$GITHUB_WORKSPACE/files/etc/apk/keys" "$GITHUB_WORKSPACE/files/etc/apk/repositories.d"
+          cp -f public-key.pem "$GITHUB_WORKSPACE/files/etc/apk/keys/momo.pem"
+          echo "$FEED/packages.adb" > "$GITHUB_WORKSPACE/files/etc/apk/repositories.d/momo.list"
+
+          # 万一这个 IB 不认 keys/，用 --allow-untrusted 兜底
+          sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
+          grep -q "allow-untrusted" Makefile || echo "WARN Makefile 里没匹配到 apk add --arch"
+
+      - name: '[momo] 换上游 sing-box 二进制'
+        if: env.ENABLE_MOMO == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 始终取上游 latest
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
+          VER="${TAG#v}"
+          echo "sing-box = $TAG"
+
+          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64.tar.gz"
+          mkdir -p sb
+          if ! curl -fL --retry 3 --retry-delay 5 -o sb/sing-box.tar.gz "$URL"; then
+            echo "ERROR: 下载失败，当前 release 的资产："
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${TAG}" \
+              | jq -r '.assets[].name' || true
             exit 1
           fi
 
-          # ImageBuilder 默认不产 initramfs 镜像（tarball 里的 .config 没开 INITRAMFS），
-          # 而首次刷机要靠它引导，所以显式打开；万一没开成功，verify 步骤只告警不失败。
-          if [ -f .config ]; then
-            grep -q '^CONFIG_TARGET_ROOTFS_INITRAMFS=y' .config \
-              || echo 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' >> .config
-          fi
+          tar -xzf sb/sing-box.tar.gz -C sb
+          SB=$(find sb -type f -name sing-box | head -1)
+          [ -n "$SB" ] || { echo "ERROR: 压缩包里没有 sing-box 二进制"; exit 1; }
+          file -b "$SB" | grep -q aarch64 || { echo "ERROR: 不是 aarch64 二进制"; file "$SB"; exit 1; }
 
-          # meow 未提供 feed，只能从 release 取包；按资产名匹配，避免 -r1/-r2 变动踩坑
-          TAG="${MEOW_TAG_INPUT:-}"
-          if [ -z "$TAG" ]; then
-            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                   https://api.github.com/repos/meow-rs/meow-rs/releases/latest | jq -r '.tag_name')
-          fi
+          # FILES 在包安装之后铺进 rootfs，所以这份一定盖掉 feed 里的旧版本
+          install -m 0755 "$SB" files/usr/bin/sing-box
+          {
+            echo "SINGBOX_TAG=$TAG"
+            echo "SINGBOX_SHA=$(sha256sum files/usr/bin/sing-box | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
+      # =====================================================================
+      #  meow（可选）
+      # =====================================================================
+      - name: '[meow] 取 apk 并建本地索引'
+        if: env.ENABLE_MEOW == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$IB_DIR"
+          mkdir -p packages
+
+          # 始终取上游 latest
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 https://api.github.com/repos/meow-rs/meow-rs/releases/latest | jq -r '.tag_name')
           [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 meow 版本失败"; exit 1; }
-          echo "meow tag = $TAG"
+          echo "meow = $TAG"
 
+          # 按资产名匹配，避开 .ipk / .sha256 / x86_64
           ASSETS=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                     "https://api.github.com/repos/meow-rs/meow-rs/releases/tags/${TAG}" \
                    | jq -r '.assets[].browser_download_url')
@@ -167,135 +281,132 @@ jobs:
           [ -n "$MEOW_APK" ] || { echo "ERROR: release 里没有 meow 的 ${PKG_ARCH} apk"; printf '%s\n' "$ASSETS"; exit 1; }
           [ -n "$LUCI_APK" ] || { echo "ERROR: release 里没有 luci-app-meow 的 apk"; printf '%s\n' "$ASSETS"; exit 1; }
 
-          # 注意必须放在 packages/ 顶层：IB 的 package_index 只 glob packages/*.apk（不递归）
-          mkdir -p packages
-          MEOW_FILE=$(basename "$MEOW_APK")
-          LUCI_FILE=$(basename "$LUCI_APK")
-          curl -fL --retry 3 -o "packages/$MEOW_FILE" "$MEOW_APK"
-          curl -fL --retry 3 -o "packages/$LUCI_FILE" "$LUCI_APK"
+          # 必须放在 packages/ 顶层：IB 的 package_index 只 glob packages/*.apk
+          curl -fL --retry 3 -o "packages/$(basename "$MEOW_APK")" "$MEOW_APK"
+          curl -fL --retry 3 -o "packages/$(basename "$LUCI_APK")" "$LUCI_APK"
 
-          # apk 会按 <name>-<version>.apk 去找包文件（OpenWrt 官方仓库就是这个命名），
-          # 上游 release 却是 <name>_<ver>_<arch>.apk，不改名会报
-          #   ERROR: meow-0.28.0-r1: package mentioned in index not found
+          # apk 按 <name>-<version>.apk 找包，上游却是 <name>_<ver>_<arch>.apk，不改名会报
+          #   ERROR: meow-x.y.z-r1: package mentioned in index not found
           rename_apk() {  # $1=文件名 $2=架构后缀
             f="$1"; a="$2"
             case "$f" in
               *_*_"${a}".apk)
-                n="${f%%_*}"
-                v="${f#*_}"
-                v="${v%_"${a}".apk}"
+                n="${f%%_*}"; v="${f#*_}"; v="${v%_"${a}".apk}"
                 mv -f "packages/$f" "packages/${n}-${v}.apk"
                 echo "renamed: $f -> ${n}-${v}.apk"
                 ;;
-              *)
-                echo "keep: $f（已是 <name>-<version>.apk 形式）"
-                ;;
+              *) echo "keep: $f" ;;
             esac
           }
-          rename_apk "$MEOW_FILE" "$PKG_ARCH"
-          rename_apk "$LUCI_FILE" "all"
+          rename_apk "$(basename "$MEOW_APK")" "$PKG_ARCH"
+          rename_apk "$(basename "$LUCI_APK")" "all"
+
+          # 包未签名 → apk add 补 --allow-untrusted
+          sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
+          grep -q "allow-untrusted" Makefile || echo "WARN Makefile 里没匹配到 apk add --arch"
 
           ls -lh packages/
-          sha256sum packages/*.apk
           echo "MEOW_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "MEOW_PKG=$(ls packages/meow-*.apk 2>/dev/null | head -1 | xargs -r basename)" >> "$GITHUB_ENV"
 
-      # 取 easytier 的 aarch64 二进制，连同 luci-app-easytier 与中文 lmo 一起铺进 FILES
-      - name: Fetch easytier & build FILES overlay
+      # =====================================================================
+      #  EasyTier（noweb + LuCI + 中文）
+      # =====================================================================
+      - name: '[easytier] 安装二进制 + LuCI + 中文'
+        if: env.ENABLE_EASYTIER == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p pkgs/et files/usr/bin files/etc/uci-defaults
 
-          # ---------- easytier（noweb：只要 core + cli） ----------
-          ET="${ET_TAG_INPUT:-}"
-          if [ -z "$ET" ]; then
-            ET=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                  https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r '.tag_name')
-          fi
-          [ -n "$ET" ] && [ "$ET" != "null" ] || { echo "ERROR: 取 EasyTier 版本失败"; exit 1; }
+          # 始终取上游 latest
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r '.tag_name')
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 EasyTier 版本失败"; exit 1; }
+          echo "EasyTier = $TAG"
+
+          mkdir -p pkgs/et
           curl -fL --retry 3 -o pkgs/easytier.zip \
-            "https://github.com/EasyTier/EasyTier/releases/download/${ET}/easytier-linux-aarch64-${ET}.zip"
+            "https://github.com/EasyTier/EasyTier/releases/download/${TAG}/easytier-linux-aarch64-${TAG}.zip"
           unzip -o -j pkgs/easytier.zip -d pkgs/et > /dev/null
+
+          # noweb 形态：只装 core + cli，不带 easytier-web（那个会额外开 8080 端口）
           for B in easytier-core easytier-cli; do
             [ -f "pkgs/et/$B" ] || { echo "ERROR: zip 里没有 $B"; exit 1; }
-            cp -a "pkgs/et/$B" files/usr/bin/
+            install -m 0755 "pkgs/et/$B" "files/usr/bin/$B"
           done
-          echo "EASYTIER_TAG=$ET" >> "$GITHUB_ENV"
 
-          # ---------- luci-app-easytier（luasrc -> /usr/lib/lua/luci，root -> /） ----------
+          # LuCI：luasrc -> /usr/lib/lua/luci，root -> /
           git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git et-src
           mkdir -p files/usr/lib/lua/luci
           cp -a et-src/luci-app-easytier/luasrc/. files/usr/lib/lua/luci/
           cp -a et-src/luci-app-easytier/root/. files/
-          chmod -R 0755 files/etc/init.d files/usr/bin 2>/dev/null || true
+          chmod -R 0755 files/etc/init.d 2>/dev/null || true
 
-          # ---------- 中文 lmo（po2lmo 必须走上游 Makefile，否则 sfh_hash 未定义） ----------
-          if git clone --depth 1 --filter=blob:none --sparse https://github.com/openwrt/luci.git luci-src \
-             && git -C luci-src sparse-checkout set modules/luci-base/src \
-             && make -C luci-src/modules/luci-base/src po2lmo \
-             && mkdir -p files/usr/lib/lua/luci/i18n \
-             && luci-src/modules/luci-base/src/po2lmo \
-                  et-src/luci-app-easytier/po/zh_Hans/easytier.po \
-                  files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo; then
-            echo "easytier 中文 lmo OK"
-          else
-            echo "WARNING: easytier 中文 lmo 生成失败，界面只有英文（不影响构建）"
-          fi
+          # 中文 lmo：po2lmo 必须走上游 Makefile（否则 undefined reference to sfh_hash）
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/openwrt/luci.git luci-src
+          git -C luci-src sparse-checkout set modules/luci-base/src
+          make -C luci-src/modules/luci-base/src po2lmo
+          mkdir -p files/usr/lib/lua/luci/i18n
+          luci-src/modules/luci-base/src/po2lmo \
+            et-src/luci-app-easytier/po/zh_Hans/easytier.po \
+            files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo
+          [ -s files/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo ] \
+            || { echo "ERROR: easytier 中文 lmo 生成失败"; exit 1; }
 
-          # ---------- 默认值（uci-defaults 在 network 启动前执行，直接生效） ----------
-          printf '%s\n' '#!/bin/sh' \
-            "uci -q set network.lan.ipaddr='${LAN_IP}'" \
-            "uci -q set network.lan.netmask='255.255.255.0'" \
-            "uci -q set system.@system[0].hostname='Taiyi'" \
-            'uci -q commit network' 'uci -q commit system' 'exit 0' \
-            > files/etc/uci-defaults/98-taiyi-net
+          echo "EASYTIER_TAG=$TAG" >> "$GITHUB_ENV"
 
-          printf '%s\n' '#!/bin/sh' \
-            "uci -q set luci.main.lang='zh_cn'" \
-            'uci -q commit luci' 'exit 0' \
-            > files/etc/uci-defaults/99-taiyi-lang
-
-          chmod 0755 files/etc/uci-defaults/*
-          echo "LAN IP = $LAN_IP, easytier = $ET"
-          find files -type f | head -20
-
-      # 只跑一次，不重试：失败就把原因和人话建议打出来
-      - name: Make image
+      # =====================================================================
+      #  构建
+      # =====================================================================
+      - name: '[build] make image'
         run: |
           set -euo pipefail
           cd "$IB_DIR"
-          PACKAGES="$(printf '%s %s' "$PKGS" "${EXTRA_PKGS:-}")"
-          echo "PACKAGES=$PACKAGES"
+          mkdir -p packages
 
-          # meow 的包未签名，给 apk add 补 --allow-untrusted（IB 若已带，这一步是 no-op）
-          sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
-          grep -q "allow-untrusted" Makefile || echo "WARNING: 没匹配到 apk add，靠 packages.adb 索引"
+          # ImageBuilder 的顺序是「先 apk add 装包，最后 prepare_rootfs 铺 FILES」
+          # （include/image.mk: target-dir-% -> include/rootfs.mk: prepare_rootfs 第一行 file_copy）
+          # 所以这里先确认 FILES 里那份 sing-box 还在、且就是刚下载的版本，
+          # 否则 build 出来会静默变回 feed 里的旧版本
+          if [ "${ENABLE_MOMO:-false}" = "true" ]; then
+            [ -f "$GITHUB_WORKSPACE/files/usr/bin/sing-box" ] \
+              || { echo "ERROR: FILES 里没有 sing-box 二进制"; exit 1; }
+            [ "$(sha256sum "$GITHUB_WORKSPACE/files/usr/bin/sing-box" | cut -d' ' -f1)" = "$SINGBOX_SHA" ] \
+              || { echo "ERROR: FILES 里的 sing-box 与下载的不一致"; exit 1; }
+            echo "  OK  FILES/sing-box = $SINGBOX_TAG"
+          fi
+
+          PACKAGES="$(printf '%s %s' "$PKGS" "${EXTRA_PKGS:-}")"
+          # momo 与 sing-box 绑定安装
+          if [ "${ENABLE_MOMO:-false}" = "true" ]; then
+            PACKAGES="$PACKAGES $MOMO_PKGS sing-box"
+          fi
+          if [ "${ENABLE_MEOW:-false}" = "true" ]; then
+            PACKAGES="$PACKAGES meow luci-app-meow"
+          fi
+          echo "PACKAGES=$PACKAGES"
 
           if make image PROFILE="$PROFILE" FILES="$GITHUB_WORKSPACE/files" PACKAGES="$PACKAGES" > build.log 2>&1; then
             echo "=== BUILD OK ==="
           else
             tail -40 build.log
-            echo "---------- apk/opkg 报错 ----------"
-            grep -E "^(ERROR|WARNING)" build.log | head -10 || true
             echo "---------- 缺失的包 ----------"
             { grep -oE "Unknown package '[^']+'" build.log | sed -E "s/.*'(.*)'/\1/" || true
               grep -oE "[A-Za-z0-9._+-]+ \(no such package\)" build.log | sed 's/ (no such package)//' || true
             } | sort -u | sed 's/^/  缺: /'
             echo "----------------------------------------"
-            echo "排查提示："
-            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑，或把 source 填 immortalwrt"
-            echo "  - 报 'package mentioned in index not found'：packages/ 里的 .apk 文件名必须是 <name>-<version>.apk"
-            echo "  - 其他：看上面 apk 报错原文"
+            echo "  - 缺 libubox20xxxxxx / libblobmsg-json20xxxxxx：上游 feed 正在重建，过几小时重跑"
+            echo "  - 报 'package mentioned in index not found'：packages/ 里的 .apk 必须是 <name>-<version>.apk"
             exit 1
           fi
 
           echo "PKGS_FINAL=$PACKAGES" >> "$GITHUB_ENV"
           ls -lh bin/targets/qualcommax/ipq60xx/
 
-      # 校验 rootfs 里该有的东西都在，然后把产物收进 out/
-      - name: Verify & collect
+      # =====================================================================
+      #  校验
+      # =====================================================================
+      - name: '[verify] 校验 rootfs'
         run: |
           set -euo pipefail
           cd "$IB_DIR"
@@ -303,31 +414,12 @@ jobs:
           T=$(find build_dir -maxdepth 3 -type d -name "root-*" | head -1)
           [ -n "$T" ] || { echo "ERROR: 找不到 TARGET_DIR"; exit 1; }
 
-          # 产物前缀随源变化（openwrt- / immortalwrt-），一律用 glob 取；
-          # 注意 pipefail 下 ls 匹配不到会返回 2，必须兜住，否则 set -e 直接静默退出
+          # pipefail 下 ls 匹配不到会返回 2，必须兜住
           SYS=$(ls "$IMG"/*squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
           [ -n "$SYS" ] || { echo "ERROR: 没有产出 squashfs-sysupgrade.bin"; ls -lh "$IMG"; exit 1; }
-          echo "  OK   $(basename "$SYS") ($(du -h "$SYS" | cut -f1))"
-
-          # initramfs：IB 不一定产（ImmortalWrt 就不产），没有就从上游下载同 snapshot 的引导镜像
-          INIT=$(ls "$IMG"/*initramfs* 2>/dev/null | head -1 || true)
-          if [ -z "$INIT" ]; then
-            INIT_NAME="${IB_PREFIX}-qualcommax-ipq60xx-${PROFILE}-initramfs-uImage.itb"
-            echo "  IB 没产 initramfs，尝试下载上游引导镜像：$INIT_NAME"
-            if curl -fsSL --retry 2 --max-time 120 -o "$INIT_NAME" \
-                 "${IB_BASE_URL}/targets/qualcommax/ipq60xx/${INIT_NAME}"; then
-              INIT="$PWD/$INIT_NAME"
-              echo "  OK   $(basename "$INIT_NAME")（来自上游，仅用于首次引导）"
-            else
-              echo "  WARN 上游也没有 initramfs，首次刷机请自行准备 rescue 镜像"
-            fi
-          else
-            echo "  OK   $(basename "$INIT")"
-          fi
 
           fail=0
           need() { [ -e "$T$1" ] && echo "  OK   $1" || { echo "  MISS $1"; fail=1; }; }
-          # 包按包数据库校验（apk：25.12+/snapshot；opkg：老版本），路径无关，比猜文件可靠
           pkg() {
             if [ -f "$T/lib/apk/db/installed" ]; then
               grep -qx "P:$1" "$T/lib/apk/db/installed" \
@@ -340,104 +432,163 @@ jobs:
             fi
           }
 
-          for P in meow luci-app-meow luci-base luci-i18n-base-zh-cn kmod-tun kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket; do pkg "$P"; done
-
-          # meow 包的文件布局（init/config/默认 yaml/gateway 脚本）+ easytier 与 uci-defaults
-          for F in /usr/bin/meow /etc/init.d/meow /etc/config/meow /etc/meow/config.yaml \
-                   /usr/share/meow/gateway.sh \
-                   /usr/bin/easytier-core /usr/bin/easytier-cli \
-                   /usr/lib/lua/luci/controller/easytier.lua \
-                   /etc/uci-defaults/99-taiyi-lang; do need "$F"; done
-          # easytier 的 init 脚本属 luci-app-easytier 的 root/，不同版本可能叫法不同，只告警
-          if [ -e "$T/etc/init.d/easytier" ]; then
-            echo "  OK   /etc/init.d/easytier"
-          else
-            echo "  WARN 没有 /etc/init.d/easytier（LuCI 里用不了启停按钮？）"
+          # ---- 基础包 ----
+          PKG_CHECK="luci-base luci-i18n-base-zh-cn kmod-tun kmod-mtd-rw kmod-nft-tproxy kmod-nft-socket"
+          if [ "${ENABLE_MOMO:-false}" = "true" ]; then
+            PKG_CHECK="$PKG_CHECK $MOMO_PKGS"
           fi
-          # LuCI 菜单（JS app 在 menu.d，老式 Lua app 在 controller），路径随版本变，只告警
-          MEOW_MENU=""
-          for M in /usr/share/luci/menu.d/luci-app-meow.json /usr/share/luci/menu.d/meow.json \
-                   /usr/lib/lua/luci/controller/meow.lua; do
-            if [ -e "$T$M" ]; then MEOW_MENU=$M; break; fi
-          done
-          if [ -n "$MEOW_MENU" ]; then
-            echo "  OK   LuCI 菜单 -> $MEOW_MENU"
+          if [ "${ENABLE_MEOW:-false}" = "true" ]; then
+            PKG_CHECK="$PKG_CHECK meow luci-app-meow"
+          fi
+          for P in $PKG_CHECK; do pkg "$P"; done
+
+          # ---- 透明代理 ----
+          if [ "${ENABLE_MOMO:-false}" = "true" ]; then
+            need /usr/bin/sing-box
+            if file -b "$T/usr/bin/sing-box" 2>/dev/null | grep -q aarch64; then
+              SB_SHA=$(sha256sum "$T/usr/bin/sing-box" | cut -d' ' -f1)
+              if [ "$SB_SHA" = "$SINGBOX_SHA" ]; then
+                echo "  OK   sing-box $SINGBOX_TAG（上游二进制已覆盖）"
+              else
+                echo "  MISS sing-box 不是上游 $SINGBOX_TAG 那份"; fail=1
+              fi
+            else
+              echo "  MISS sing-box 不是 aarch64"; fail=1
+            fi
+
+            MOMO_MENU=""
+            for M in /usr/share/luci/menu.d/luci-app-momo.json \
+                     /usr/share/luci/menu.d/momo.json \
+                     /usr/lib/lua/luci/controller/momo.lua; do
+              if [ -e "$T$M" ]; then MOMO_MENU=$M; break; fi
+            done
+            if [ -n "$MOMO_MENU" ]; then
+              echo "  OK   LuCI 菜单 -> $MOMO_MENU"
+            else
+              echo "  MISS 没找到 luci-app-momo 的菜单文件"; fail=1
+            fi
+            need /etc/apk/keys/momo.pem
           else
-            echo "  WARN 没找到 luci-app-meow 的菜单文件（包已装，可能改了路径）"
+            if [ -e "$T/usr/bin/sing-box" ]; then
+              echo "  MISS 没开 ENABLE_MOMO，rootfs 里却有 sing-box"; fail=1
+            fi
           fi
 
-          # meow 必须是 aarch64（包架构选错的话这里能看出来）
-          if file -b "$T/usr/bin/meow" 2>/dev/null | grep -q aarch64; then
-            echo "  OK   meow 架构 aarch64"
+          # ---- meow（可选）----
+          if [ "${ENABLE_MEOW:-false}" = "true" ]; then
+            for F in /usr/bin/meow /etc/init.d/meow /etc/config/meow \
+                     /etc/meow/config.yaml /usr/share/meow/gateway.sh; do need "$F"; done
+            if file -b "$T/usr/bin/meow" 2>/dev/null | grep -q aarch64; then
+              echo "  OK   meow 架构 aarch64"
+            else
+              echo "  MISS meow 不是 aarch64"; fail=1
+            fi
           else
-            echo "  MISS meow 不是 aarch64 二进制"; file "$T/usr/bin/meow" || true; fail=1
+            if [ -e "$T/usr/bin/meow" ]; then
+              echo "  MISS 没开 ENABLE_MEOW，rootfs 里却有 meow"; fail=1
+            fi
           fi
 
-          # rpcd 在 /sbin（个别版本 /usr/sbin），两个都认
+          # ---- EasyTier（可选）----
+          if [ "${ENABLE_EASYTIER:-false}" = "true" ]; then
+            for F in /usr/bin/easytier-core /usr/bin/easytier-cli \
+                     /usr/lib/lua/luci/controller/easytier.lua; do need "$F"; done
+            [ -s "$T/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo" ] \
+              && echo "  OK   easytier.zh-cn.lmo" \
+              || echo "  WARN 缺 easytier 中文 lmo（只影响翻译）"
+            if [ -e "$T/usr/bin/easytier-web" ] || [ -e "$T/usr/bin/easytier-web-embed" ]; then
+              echo "  MISS 出现 easytier-web，应为 noweb 形态"; fail=1
+            fi
+          else
+            if [ -e "$T/usr/bin/easytier-core" ]; then
+              echo "  MISS 没开 ENABLE_EASYTIER，rootfs 里却有 easytier"; fail=1
+            fi
+          fi
+
+          # ---- LuCI / 内核模块 ----
           RPCD=""
           for C in /sbin/rpcd /usr/sbin/rpcd; do
             if [ -x "$T$C" ]; then RPCD=$C; break; fi
           done
           if [ -n "$RPCD" ]; then echo "  OK   $RPCD"; else echo "  MISS rpcd"; fail=1; fi
 
-          # 内核模块：TUN、mtd-rw、透明代理两个 kmod 是硬需求
           KOS=$(find "$T/lib/modules" \( -name 'tun.ko*' -o -name 'mtd-rw.ko*' -o -name 'nft_tproxy.ko*' -o -name 'nft_socket.ko*' \) 2>/dev/null | sort)
-          echo "$KOS" | sed "s|^$T|  OK  |"
           KO_COUNT=$(printf '%s\n' "$KOS" | grep -c '\.ko' || true)
           [ "$KO_COUNT" -ge 4 ] || { echo "  MISS tun/mtd-rw/nft_tproxy/nft_socket 内核模块"; fail=1; }
 
-          # easytier 必须 noweb 形态；中文 lmo 可选
-          if [ -e "$T/usr/bin/easytier-web" ] || [ -e "$T/usr/bin/easytier-web-embed" ]; then
-            echo "  MISS 出现 easytier-web，应为 noweb 形态"; fail=1
-          else
-            echo "  OK   easytier noweb 形态"
-          fi
-          [ -s "$T/usr/lib/lua/luci/i18n/easytier.zh-cn.lmo" ] \
-            && echo "  OK   easytier.zh-cn.lmo" \
-            || echo "  WARN 缺 easytier 中文 lmo（只影响翻译）"
-
           [ "$fail" -eq 0 ] || { echo "ERROR: rootfs 校验失败"; exit 1; }
+          echo "  OK   $(basename "$SYS") ($(du -h "$SYS" | cut -f1))"
 
-          # ---------- 收集产物 ----------
-          OUT="$GITHUB_WORKSPACE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
+      # =====================================================================
+      #  产物
+      # =====================================================================
+      - name: '[release] 收集产物'
+        run: |
+          set -euo pipefail
+          cd "$IB_DIR"
+          IMG=bin/targets/qualcommax/ipq60xx
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+
+          SYS=$(ls "$IMG"/*squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
+          [ -n "$SYS" ] || { echo "ERROR: 找不到 squashfs-sysupgrade.bin"; exit 1; }
           cp -f "$SYS" "$OUT/$(basename "$SYS")"
-          if [ -n "$INIT" ]; then
+
+          # initramfs：IB 不一定产，没有就从上游下载同 snapshot 的引导镜像
+          INIT=$(ls "$IMG"/*initramfs* 2>/dev/null | head -1 || true)
+          if [ -z "$INIT" ]; then
+            INIT_NAME="${IB_PREFIX}-qualcommax-ipq60xx-${PROFILE}-initramfs-uImage.itb"
+            echo "IB 没产 initramfs，尝试下载上游引导镜像：$INIT_NAME"
+            if curl -fsSL --retry 2 --max-time 120 -o "$OUT/$INIT_NAME" \
+                 "${IB_BASE_URL}/targets/qualcommax/ipq60xx/${INIT_NAME}"; then
+              echo "  OK   $INIT_NAME（来自上游，仅用于首次引导）"
+            else
+              rm -f "$OUT/$INIT_NAME"
+              echo "  WARN 上游也没有 initramfs，首次刷机请自行准备 rescue 镜像"
+            fi
+          else
             cp -f "$INIT" "$OUT/$(basename "$INIT")"
           fi
+
           {
             echo "device  : JDCloud ${DEVICE_NAME} (${PROFILE})"
             echo "source  : ${OPENWRT_DISTRIB} (${OPENWRT_BUILD})"
-            echo "meow    : ${MEOW_TAG}  (${MEOW_PKG})"
-            echo "easytier: ${EASYTIER_TAG}"
             echo "lan ip  : ${LAN_IP}"
+            echo "momo    : ${MOMO_PKGS:-disabled} (branch ${MOMO_BRANCH:-n/a})"
+            echo "singbox : ${SINGBOX_TAG:-disabled}"
+            echo "easytier: ${EASYTIER_TAG:-disabled}"
+            echo "meow    : ${MEOW_TAG:-disabled}"
             echo "build   : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "packages: ${PKGS_FINAL}"
           } > "$OUT/build-info.txt"
+
           ( cd "$OUT" && sha256sum * > sha256sums.txt && cat build-info.txt && ls -lh )
 
-      - name: Upload Firmware To Release
+      - name: '[release] 发布到 Release'
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.RELEASE_TAG }}
-          name: JDCloud Taiyi RE-CS-07 (LuCI + meow + easytier)
+          name: JDCloud Taiyi RE-CS-07 (momo + sing-box)
+          artifacts: out/*
           allowUpdates: true
           removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
-          artifacts: out/*
           body: |
             JDCloud 太乙 RE-CS-07 ｜ IPQ6018 / 2G RAM / 8G eMMC / 1WAN+3LAN 千兆 / 无 WiFi
             构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）｜ profile `jdcloud_re-cs-07` ｜ 默认 LAN `${{ env.LAN_IP }}`（中文界面）
 
-            **预装**：LuCI 全套 + meow ${{ env.MEOW_TAG }}（luci-app-meow）+ EasyTier ${{ env.EASYTIER_TAG }} noweb（中文）
-            kmod：tun / mtd-rw / nft-tproxy / nft-socket / nft-nat / nft-fib / inet-diag / fs-f2fs
+            **预装**
+            - momo（luci-app-momo）+ sing-box `${{ env.SINGBOX_TAG }}`（上游 arm64 静态二进制，已覆盖 feed 版本）
+            - EasyTier `${{ env.EASYTIER_TAG }}` noweb（中文）
+            - kmod：tun / mtd-rw / nft-tproxy / nft-socket / nft-nat / nft-fib / inet-diag / fs-f2fs
 
-            **meow**：`http://${{ env.LAN_IP }}` → 服务 → meow
-            - Configuration 贴 mihomo/Clash YAML（保存前 `meow -t` 校验）；Settings 勾启用 + 开透明代理（默认 tproxy）
-            - 配置文件 `/etc/meow/config.yaml`，默认不自启动；easytier 在「服务 → EasyTier」里启用
+            **momo**：`http://${{ env.LAN_IP }}` → 服务 → Momo
+            - 配置在 LuCI 里编辑（Redirect / TPROXY / TUN），默认不自启动
+            - `sing-box version` 可确认已是最新版本
+            - 刷机后装语言包：`apk update && apk add luci-i18n-momo-zh-cn`（公钥已预置 `/etc/apk/keys/momo.pem`）
 
             **刷机**：U-Boot 引导 `initramfs-uImage.itb` → 系统里 `sysupgrade -n *-squashfs-sysupgrade.bin`
             需第三方 U-Boot `uboot-ipq60xx-emmc-jdcloud_re-cs-07.bin`（machid 0x8030202，别用 cs-02 的）
 
-            **提示**：meow/TUN/easytier 都在用户态，建议关掉 flow_offloading 与 packet_steering；
-            meow 包未签名，升级用 `apk add --allow-untrusted ./meow_<ver>-r1_<arch>.apk`。
+            **提示**：建议关掉 flow_offloading 与 packet_steering；
             snapshot 是滚动的，刷完先验证「改配置 → 重启 → 配置是否保留」（f2fs/overlay）。
