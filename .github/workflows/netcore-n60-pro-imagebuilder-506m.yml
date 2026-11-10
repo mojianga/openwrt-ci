@@ -12,7 +12,8 @@ name: netcore-n60pro-imagebuilder-506m
 #    ENABLE_EASYTIER=true   EasyTier（noweb）+ luci-app-easytier + 中文
 #    ENABLE_MEOW=false      meow-rs（Rust 版 mihomo，需 .apk 体系）
 #
-#  sing-box 不用 feed 版本：始终取 SagerNet/sing-box 最新 release 的静态二进制，
+#  sing-box 不用 feed 版本：始终取 SagerNet/sing-box 最新 release 的 linux-arm64-musl 构建
+#  （OpenWrt 是 musl libc，glibc 动态链接版跑不起来；没有 -musl 资产时退回通用版并做 ELF 检查），
 #  覆盖 /usr/bin/sing-box（momo / EasyTier / meow 同样都取各自上游 latest，无需指定版本）
 #  momo 走自建签名 feed，公钥预置在 /etc/apk/keys/momo.pem，刷机后 apk 直接可用
 #
@@ -244,39 +245,57 @@ jobs:
           sed -i 's|[$](APK) add --arch|$(APK) add --allow-untrusted --arch|' Makefile
           grep -q "allow-untrusted" Makefile || echo "WARN Makefile 里没匹配到 apk add --arch"
 
-      - name: '[momo] 换上游 sing-box 二进制'
+      - name: '[momo] 换上游 sing-box 二进制（musl）'
         if: env.ENABLE_MOMO == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          # 始终取上游 latest
-          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-                 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
+          # 始终取上游 latest；顺带拿到资产清单，文件名按实际 release 挑，不靠猜
+          REL=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 https://api.github.com/repos/SagerNet/sing-box/releases/latest)
+          TAG=$(printf '%s' "$REL" | jq -r '.tag_name')
           [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "ERROR: 取 sing-box 版本失败"; exit 1; }
           VER="${TAG#v}"
           echo "sing-box = $TAG"
 
-          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-arm64.tar.gz"
-          mkdir -p sb
-          if ! curl -fL --retry 3 --retry-delay 5 -o sb/sing-box.tar.gz "$URL"; then
-            echo "ERROR: 下载失败，当前 release 的资产："
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${TAG}" \
-              | jq -r '.assets[].name' || true
-            exit 1
+          # 本机是 OpenWrt（musl libc）：必须用 -musl 构建，glibc 动态链接版刷进去直接跑不起来
+          # 老 release 没有 -musl 时退回通用版，由下面的 ELF 解释器检查兜底
+          ASSETS=$(printf '%s' "$REL" | jq -r '.assets[].name')
+          SB_ASSET=$(printf '%s\n' "$ASSETS" | grep -Ex "sing-box-${VER}-linux-arm64-musl\.tar\.gz" | head -1 || true)
+          if [ -z "$SB_ASSET" ]; then
+            SB_ASSET=$(printf '%s\n' "$ASSETS" | grep -Ex "sing-box-${VER}-linux-arm64\.tar\.gz" | head -1 || true)
+            [ -n "$SB_ASSET" ] && echo "WARN 上游没有 ${VER} 的 linux-arm64-musl，退回 $SB_ASSET"
           fi
+          [ -n "$SB_ASSET" ] || {
+            echo "ERROR: release 里没有 linux-arm64 资产，现有 arm64 资产："
+            printf '%s\n' "$ASSETS" | grep arm64 || true
+            exit 1
+          }
+          echo "asset = $SB_ASSET"
+
+          URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/${SB_ASSET}"
+          mkdir -p sb
+          curl -fL --retry 3 --retry-delay 5 -o sb/sing-box.tar.gz "$URL" \
+            || { echo "ERROR: 下载失败 $URL"; exit 1; }
 
           tar -xzf sb/sing-box.tar.gz -C sb
           SB=$(find sb -type f -name sing-box | head -1)
           [ -n "$SB" ] || { echo "ERROR: 压缩包里没有 sing-box 二进制"; exit 1; }
           file -b "$SB" | grep -q aarch64 || { echo "ERROR: 不是 aarch64 二进制"; file "$SB"; exit 1; }
+          # 兜死：动态链接且解释器是 glibc 的一律拒收（musl 版是 /lib/ld-musl-aarch64.so.1 或静态）
+          if file -b "$SB" | grep -qi 'ld-linux'; then
+            echo "ERROR: 这是 glibc 动态链接的二进制，OpenWrt(musl) 上跑不起来：$SB_ASSET"
+            file "$SB"
+            exit 1
+          fi
 
           # FILES 在包安装之后铺进 rootfs，所以这份一定盖掉 feed 里的旧版本
           install -m 0755 "$SB" files/usr/bin/sing-box
           {
             echo "SINGBOX_TAG=$TAG"
+            echo "SINGBOX_ASSET=$SB_ASSET"
             echo "SINGBOX_SHA=$(sha256sum files/usr/bin/sing-box | cut -d' ' -f1)"
           } >> "$GITHUB_ENV"
 
@@ -487,9 +506,12 @@ jobs:
             [ -f "$TARGET/usr/bin/sing-box" ] || { echo "ERROR: rootfs 里没有 /usr/bin/sing-box"; exit 1; }
             file -b "$TARGET/usr/bin/sing-box" | grep -q aarch64 \
               || { echo "ERROR: /usr/bin/sing-box 不是 aarch64"; exit 1; }
+            if file -b "$TARGET/usr/bin/sing-box" | grep -qi 'ld-linux'; then
+              echo "ERROR: /usr/bin/sing-box 是 glibc 动态链接版，OpenWrt(musl) 跑不起来"; exit 1
+            fi
             [ "$(sha256sum "$TARGET/usr/bin/sing-box" | cut -d' ' -f1)" = "$SINGBOX_SHA" ] \
               || { echo "ERROR: sing-box 不是上游 $SINGBOX_TAG 那份"; exit 1; }
-            echo "  OK  sing-box $SINGBOX_TAG（上游二进制已覆盖）"
+            echo "  OK  sing-box $SINGBOX_TAG（${SINGBOX_ASSET:-上游二进制} 已覆盖）"
 
             MOMO_MENU=""
             for M in /usr/share/luci/menu.d/luci-app-momo.json \
@@ -631,7 +653,7 @@ jobs:
             echo "ubi     : ${UBI_506M}"
             echo "lan ip  : ${LAN_IP}"
             echo "momo    : ${MOMO_PKGS:-disabled} (branch ${MOMO_BRANCH:-n/a})"
-            echo "singbox : ${SINGBOX_TAG:-disabled}"
+            echo "singbox : ${SINGBOX_TAG:-disabled} (${SINGBOX_ASSET:-n/a})"
             echo "easytier: ${EASYTIER_TAG:-disabled}"
             echo "meow    : ${MEOW_TAG:-disabled}"
             echo "build   : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -654,7 +676,7 @@ jobs:
             构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）｜ 默认 LAN `${{ env.LAN_IP }}`（中文界面）
 
             **预装**
-            - momo（luci-app-momo）+ sing-box `${{ env.SINGBOX_TAG }}`（上游 arm64 静态二进制，已覆盖 feed 版本）
+            - momo（luci-app-momo）+ sing-box `${{ env.SINGBOX_TAG }}`（上游 linux-arm64 **musl** 构建，已覆盖 feed 版本）
             - EasyTier `${{ env.EASYTIER_TAG }}` noweb（中文）
             - UPnP / PPPoE / IPv6 默认开启
             - kmod：mtd-rw / tun / dummy / nft-tproxy,socket,nat,fib / ppp,pppoe,ppox
