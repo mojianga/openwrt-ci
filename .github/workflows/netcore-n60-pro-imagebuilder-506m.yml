@@ -8,9 +8,9 @@ name: netcore-n60pro-imagebuilder-506m
 #    - 要固定 ABI / 可复现就填 openwrt_version=25.12.6
 #
 #  预装软件（开关优先级：dispatch 输入 > 仓库变量 > 默认值）
-#    ENABLE_MOMO=true       momo + luci-app-momo + sing-box（momo 依赖 sing-box，绑一起）
+#    ENABLE_MOMO=false      momo + luci-app-momo + sing-box（momo 依赖 sing-box，绑一起；默认不装）
 #    ENABLE_EASYTIER=true   EasyTier（noweb）+ luci-app-easytier + 中文
-#    ENABLE_MEOW=false      meow-rs（Rust 版 mihomo，需 .apk 体系）
+#    ENABLE_MEOW=true       meow-rs（Rust 版 mihomo，需 .apk 体系）+ luci-app-meow
 #
 #  sing-box 不用 feed 版本：始终取 SagerNet/sing-box 最新 release 的 linux-arm64-musl 构建
 #  （OpenWrt 是 musl libc，glibc 动态链接版跑不起来；没有 -musl 资产时退回通用版并做 ELF 检查），
@@ -33,7 +33,7 @@ on:
         required: false
         default: '192.168.12.1'
       enable_momo:
-        description: 'momo + sing-box；留空=仓库变量 ENABLE_MOMO 或默认 true'
+        description: 'momo + sing-box（默认不装）；留空=仓库变量 ENABLE_MOMO 或默认 false'
         required: false
         default: ''
       enable_easytier:
@@ -41,7 +41,7 @@ on:
         required: false
         default: ''
       enable_meow:
-        description: 'meow-rs；留空=仓库变量 ENABLE_MEOW 或默认 false'
+        description: 'meow-rs；留空=仓库变量 ENABLE_MEOW 或默认 true'
         required: false
         default: ''
   # 点 star 触发（只在默认分支生效）
@@ -72,9 +72,9 @@ env:
   LAN_IP: ${{ github.event.inputs.lan_ip || '192.168.12.1' }}
 
   # ---- 软件开关（dispatch 输入 > 仓库变量 > 默认值）----
-  ENABLE_MOMO: ${{ github.event.inputs.enable_momo || vars.ENABLE_MOMO || 'true' }}
+  ENABLE_MOMO: ${{ github.event.inputs.enable_momo || vars.ENABLE_MOMO || 'false' }}
   ENABLE_EASYTIER: ${{ github.event.inputs.enable_easytier || vars.ENABLE_EASYTIER || 'true' }}
-  ENABLE_MEOW: ${{ github.event.inputs.enable_meow || vars.ENABLE_MEOW || 'false' }}
+  ENABLE_MEOW: ${{ github.event.inputs.enable_meow || vars.ENABLE_MEOW || 'true' }}
 
   # ---- 版本：三个软件都直接取上游 latest，不需要指定 ----
 
@@ -666,7 +666,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ env.TAG }}
-          name: Netcore N60 Pro 506.5MB (momo + sing-box)
+          name: Netcore N60 Pro 506.5MB (easytier + meow)
           artifacts: out/*
           allowUpdates: true
           removeArtifacts: true
@@ -676,15 +676,17 @@ jobs:
             构建源：${{ env.OPENWRT_DISTRIB }}（${{ env.OPENWRT_BUILD }}）｜ 默认 LAN `${{ env.LAN_IP }}`（中文界面）
 
             **预装**
-            - momo（luci-app-momo）+ sing-box `${{ env.SINGBOX_TAG }}`（上游 linux-arm64 **musl** 构建，已覆盖 feed 版本）
+            - meow-rs `${{ env.MEOW_TAG }}` + luci-app-meow
             - EasyTier `${{ env.EASYTIER_TAG }}` noweb（中文）
             - UPnP / PPPoE / IPv6 默认开启
             - kmod：mtd-rw / tun / dummy / nft-tproxy,socket,nat,fib / ppp,pppoe,ppox
 
-            **momo**：`http://${{ env.LAN_IP }}` → 服务 → Momo
-            - 配置在 LuCI 里编辑（Redirect / TPROXY / TUN），默认不自启动
-            - `sing-box version` 可确认已是最新版本
-            - 刷机后装语言包：`apk update && apk add luci-i18n-momo-zh-cn`（公钥已预置 `/etc/apk/keys/momo.pem`）
+            **meow**：`http://${{ env.LAN_IP }}` → 服务 → Meow
+            - 配置在 LuCI 里编辑（tproxy / redirect / TUN），默认不自启动
+            - `meow -v` 可确认版本
+
+            **momo / sing-box**：默认不装。需要时把仓库变量 `ENABLE_MOMO` 设为 true，
+            构建会一并安装 sing-box（上游 linux-arm64 musl 构建，覆盖 feed 版本）
 
             **刷机**：同为 506M 分区可直接 sysupgrade；从 128M 原厂跨过来必须先刷目标分区表的 recovery，且不保留配置
 
